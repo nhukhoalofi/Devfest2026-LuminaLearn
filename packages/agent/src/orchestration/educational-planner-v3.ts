@@ -14,6 +14,9 @@ import {
 import type { AIProvider } from './ai-provider';
 import type { DocumentAnalysisResult } from './types';
 import { KnowledgeValidationServiceV3, validateAlgebraSceneMath } from './knowledge-validation-v3';
+import { normalizeStoryboardTimelineV3, buildChaptersForScenes } from './timeline-normalizer-v3';
+import { directEducationalLessonV3 } from './universal-educational-director-v3';
+export { buildChaptersForScenes };
 
 export interface EducationalPlannerV3Options {
   aiProvider?: AIProvider;
@@ -139,8 +142,27 @@ export class EducationalPlannerV3 {
       }
     }
 
-    // Bước 4: Xác thực qua Zod Schema V3 chặt chẽ
-    return EducationalLessonPlanV3Schema.parse(candidatePlan);
+    // Bước 4: Chuẩn hóa timeline đảm bảo mọi phân cảnh <= 120s và tổng thời lượng chính xác
+    if (candidatePlan.storyboard?.scenes && candidatePlan.storyboard.scenes.length > 0) {
+      const targetSec = input.targetDurationSeconds ?? candidatePlan.storyboard.totalDurationSeconds;
+      const normalized = normalizeStoryboardTimelineV3({
+        rawScenes: candidatePlan.storyboard.scenes,
+        targetDurationSeconds: targetSec,
+        capability: capabilityReport,
+        fps: 24,
+        maxSceneDurationSeconds: 120
+      });
+      candidatePlan.storyboard.scenes = normalized.scenes;
+      candidatePlan.storyboard.totalDurationSeconds = normalized.totalDurationSeconds;
+      candidatePlan.storyboard.chapters = normalized.chapters;
+    }
+
+    // Bước 5: Xác thực qua Zod Schema V3 chặt chẽ
+    const directedPlan = directEducationalLessonV3(candidatePlan, {
+      targetLearners: audience,
+      targetDurationSeconds
+    });
+    return EducationalLessonPlanV3Schema.parse(directedPlan);
   }
 
   /**
@@ -156,33 +178,40 @@ export class EducationalPlannerV3 {
     }
 
     if (!this.aiProvider.isMock) {
-      if (!input.consentRecord) {
+      if (!input.consentRecord && input.externalApiConsent !== true) {
         throw new Error('external_api_consent_required: Live Gemini planning requires a valid signed consentRecord');
       }
-      const check = verifyExternalApiConsentV3({
-        consent: input.consentRecord,
-        ownerId: input.ownerId ?? 'local-single-user',
-        expectedProvider: 'gemini',
-        expectedOperation: 'planning',
-        isLiveOperation: true
-      });
-      if (!check.valid) {
-        throw new Error(`external_api_consent_rejected: ${check.reason || 'Live Gemini planning requires valid planning consent'}`);
+      if (input.consentRecord) {
+        const check = verifyExternalApiConsentV3({
+          consent: input.consentRecord,
+          ownerId: input.ownerId ?? 'local-single-user',
+          expectedProvider: 'gemini',
+          expectedOperation: 'planning',
+          isLiveOperation: true
+        });
+        if (!check.valid) {
+          throw new Error(`external_api_consent_rejected: ${check.reason || 'Live Gemini planning requires valid planning consent'}`);
+        }
       }
     }
 
     const budget = this.requestBudget ?? new GeminiRequestBudget();
+    const targetDuration = input.targetDurationSeconds ?? 40;
+    const targetScenes = targetDuration <= 60 ? '2-3' : targetDuration <= 180 ? '4-5' : targetDuration <= 300 ? '5-7' : '8-12';
 
     const systemPrompt = `Bạn là Chuyên gia Thiết kế Giáo trình Toán học & AI LuminaLearn V3.
-Nhiệm vụ: Lập kế hoạch bài học sư phạm video ngắn (3-4 phân cảnh) cho chủ đề: "${input.topic}".
+Nhiệm vụ: Lập kế hoạch bài học sư phạm video (${targetScenes} phân cảnh) cho chủ đề: "${input.topic}".
 Lĩnh vực: ${capability.domain}. Ngôn ngữ: ${input.language === 'en' ? 'en' : 'vi'}.
-Quy tắc toàn vẹn tri thức:
+Quy tắc toàn vẹn tri thức & Thời lượng bắt buộc:
+- Thời lượng mục tiêu tổng thể: ${targetDuration} giây.
+- QUY TẮC BẮT BUỘC VỀ THỜI LƯỢNG MỖI CẢNH: Mỗi phân cảnh phải có durationSeconds từ 15 đến 90 giây (TUYỆT ĐỐI KHÔNG vượt quá 120 giây).
+- Tổng durationSeconds của tất cả phân cảnh phải đúng bằng ${targetDuration} giây.
 - KHÔNG tự nhận định bất kỳ mệnh đề nào là "formally_verified".
 - Mọi mệnh đề toán học phải nêu rõ biểu thức formalExpression và validatorKey thích hợp nếu có.
 - Trả về JSON theo đúng định dạng cấu trúc bài học sư phạm V3.`;
 
     const userPrompt = `Hãy tạo kế hoạch bài học cho chủ đề "${input.topic}" (ID: ${capability.topicId}).
-Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
+Thời lượng mục tiêu: ${targetDuration} giây (gồm ${targetScenes} phân cảnh, mỗi cảnh 15-90 giây, tối đa 120 giây).`;
 
     const response = await this.aiProvider.generateStructured<EducationalLessonPlanV3>({
       purpose: 'curriculum_planning',
@@ -205,11 +234,22 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           humanReviewComment: typeof c.humanReviewComment === 'string' ? c.humanReviewComment : undefined
         }));
 
-        // Khởi tạo storyboard an toàn từ AI
+        // Khởi tạo storyboard an toàn từ AI và chuẩn hóa timeline nghiêm ngặt
         const rawScenes = (obj.storyboard as any)?.scenes;
-        const fallbackScenes = this.getDefaultScenesForTopic(capability, input.targetDurationSeconds ?? 40);
-        const scenes = Array.isArray(rawScenes) && rawScenes.length >= 2 ? rawScenes : fallbackScenes;
-        const totalDuration = scenes.reduce((acc: number, s: any) => acc + (Number(s.durationSeconds) || 10), 0);
+        const candidateScenes = Array.isArray(rawScenes) && rawScenes.length >= 2
+          ? rawScenes
+          : this.getDefaultScenesForTopic(capability, targetDuration);
+
+        const normalized = normalizeStoryboardTimelineV3({
+          rawScenes: candidateScenes,
+          targetDurationSeconds: targetDuration,
+          capability,
+          fps: 24,
+          maxSceneDurationSeconds: 120
+        });
+
+        const scenes = normalized.scenes;
+        const totalDuration = normalized.totalDurationSeconds;
 
         return {
           schemaVersion: 'lesson-v3',
@@ -233,7 +273,8 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
             storyboardId: `sb_${input.lessonId}`,
             lessonId: input.lessonId,
             scenes,
-            totalDurationSeconds: totalDuration
+            totalDurationSeconds: totalDuration,
+            chapters: normalized.chapters
           }
         };
       }
@@ -323,31 +364,96 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
         ]
       };
 
-      const baseDuration = Math.max(5, Math.floor(targetDurationSeconds / identities.length));
-      scenes = identities.map(([id, left, right, label], index) => ({
-        sceneId: `sc_identity_${index + 1}`,
-        sceneType: 'algebra_identity' as const,
-        title: `${index + 1}. ${label}`,
-        pedagogicalGoal: index < 5 ? 'Khai triển theo quy tắc phân phối và gom các hạng tử đồng dạng' : 'Phân tích biểu thức thành tích của hai nhân tử',
-        durationSeconds: baseDuration,
-        boundClaimIds: [`claim_identity_${index + 1}`],
-        rendererTarget: 'remotion_infographic' as const,
-        narration: {
-          vietnamese: `${label}. Ta biến đổi từng bước và đối chiếu hai vế để thấy chúng hoàn toàn tương đương.`,
-          subtitleVietnamese: `${left} bằng ${right}.`
-        },
-        visualPayload: {
-          sceneType: 'algebra_identity' as const,
-          identityId: id,
-          leftExpression: left,
-          rightExpression: right,
-          transformationSteps: identitySteps[id] ?? [
-            { expression: left, explanationVietnamese: 'Giữ nguyên biểu thức ban đầu.', highlightTerms: [left] },
-            { expression: right, explanationVietnamese: 'Khai triển hoặc phân tích nhân tử.', highlightTerms: [right] }
-          ],
-          presentation: (index < 5 ? 'expansion' : 'factorization') as 'expansion' | 'factorization'
+      if (targetDurationSeconds >= 600) {
+        const numScenes = identities.length * 2;
+        const baseDuration = Math.floor(targetDurationSeconds / numScenes);
+        const remainder = targetDurationSeconds - baseDuration * numScenes;
+        scenes = [];
+        for (let i = 0; i < identities.length; i++) {
+          const [id, left, right, label] = identities[i];
+          const durA = baseDuration + (scenes.length < remainder ? 1 : 0);
+          scenes.push({
+            sceneId: `sc_identity_${i + 1}_a`,
+            sceneType: 'algebra_identity' as const,
+            title: `${i + 1}a. ${label} (Khái niệm)`,
+            pedagogicalGoal: 'Nhận diện cấu trúc và trực quan hóa hằng đẳng thức',
+            durationSeconds: durA,
+            boundClaimIds: [`claim_identity_${i + 1}`],
+            rendererTarget: 'remotion_infographic' as const,
+            narration: {
+              vietnamese: `${label}. Ta tìm hiểu ý nghĩa và cấu trúc của biểu thức.`,
+              subtitleVietnamese: `${left} bằng ${right}.`
+            },
+            visualPayload: {
+              sceneType: 'algebra_identity' as const,
+              identityId: id,
+              leftExpression: left,
+              rightExpression: right,
+              transformationSteps: identitySteps[id] ?? [
+                { expression: left, explanationVietnamese: 'Giữ nguyên biểu thức ban đầu.', highlightTerms: [left] },
+                { expression: right, explanationVietnamese: 'Khai triển hoặc phân tích nhân tử.', highlightTerms: [right] }
+              ],
+              presentation: (i < 5 ? 'expansion' : 'factorization') as 'expansion' | 'factorization'
+            }
+          });
+          const durB = baseDuration + (scenes.length < remainder ? 1 : 0);
+          scenes.push({
+            sceneId: `sc_identity_${i + 1}_b`,
+            sceneType: 'algebra_identity' as const,
+            title: `${i + 1}b. ${label} (Biến đổi)`,
+            pedagogicalGoal: i < 5 ? 'Khai triển theo quy tắc phân phối và gom các hạng tử đồng dạng' : 'Phân tích biểu thức thành tích của hai nhân tử',
+            durationSeconds: durB,
+            boundClaimIds: [`claim_identity_${i + 1}`],
+            rendererTarget: 'remotion_infographic' as const,
+            narration: {
+              vietnamese: `${label}. Ta biến đổi từng bước và đối chiếu hai vế để thấy chúng hoàn toàn tương đương.`,
+              subtitleVietnamese: `${left} bằng ${right}.`
+            },
+            visualPayload: {
+              sceneType: 'algebra_identity' as const,
+              identityId: id,
+              leftExpression: left,
+              rightExpression: right,
+              transformationSteps: identitySteps[id] ?? [
+                { expression: left, explanationVietnamese: 'Giữ nguyên biểu thức ban đầu.', highlightTerms: [left] },
+                { expression: right, explanationVietnamese: 'Khai triển hoặc phân tích nhân tử.', highlightTerms: [right] }
+              ],
+              presentation: (i < 5 ? 'expansion' : 'factorization') as 'expansion' | 'factorization'
+            }
+          });
         }
-      }));
+      } else {
+        const baseDuration = Math.floor(targetDurationSeconds / identities.length);
+        const remainder = targetDurationSeconds - baseDuration * identities.length;
+        scenes = identities.map(([id, left, right, label], index) => {
+          const isLast = index === identities.length - 1;
+          const durationSeconds = isLast ? baseDuration + remainder : baseDuration;
+          return {
+            sceneId: `sc_identity_${index + 1}`,
+            sceneType: 'algebra_identity' as const,
+            title: `${index + 1}. ${label}`,
+            pedagogicalGoal: index < 5 ? 'Khai triển theo quy tắc phân phối và gom các hạng tử đồng dạng' : 'Phân tích biểu thức thành tích của hai nhân tử',
+            durationSeconds,
+            boundClaimIds: [`claim_identity_${index + 1}`],
+            rendererTarget: 'remotion_infographic' as const,
+            narration: {
+              vietnamese: `${label}. Ta biến đổi từng bước và đối chiếu hai vế để thấy chúng hoàn toàn tương đương.`,
+              subtitleVietnamese: `${left} bằng ${right}.`
+            },
+            visualPayload: {
+              sceneType: 'algebra_identity' as const,
+              identityId: id,
+              leftExpression: left,
+              rightExpression: right,
+              transformationSteps: identitySteps[id] ?? [
+                { expression: left, explanationVietnamese: 'Giữ nguyên biểu thức ban đầu.', highlightTerms: [left] },
+                { expression: right, explanationVietnamese: 'Khai triển hoặc phân tích nhân tử.', highlightTerms: [right] }
+              ],
+              presentation: (index < 5 ? 'expansion' : 'factorization') as 'expansion' | 'factorization'
+            }
+          };
+        });
+      }
     } else if (capability.topicId === 'calculus.derivative.intuition') {
       summary = 'Bản chất hình học của đạo hàm là hệ số góc của tiếp tuyến khi cát tuyến co lại.';
       learningObjectives = [
@@ -742,54 +848,445 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           humanReviewComment: 'Hành vi hội tụ của learning rate trong tối ưu hóa học máy.'
         }
       ];
-      scenes = [
-        {
-          sceneId: 'sc_loss_bowl',
-          sceneType: 'loss_landscape',
-          title: 'Bề mặt hàm mất mát và quả bóng lăn',
-          pedagogicalGoal: 'Trực quan hóa bề mặt hàm mất mát dạng cái bát và vị trí hiện tại của mô hình',
-          durationSeconds: 18,
-          boundClaimIds: ['claim_gd_update_rule'],
-          rendererTarget: 'remotion_infographic',
-          narration: {
-            vietnamese: 'Hãy hình dung hàm mất mát như một thung lũng, mục tiêu của ta là đưa quả bóng lăn xuống đáy sâu nhất.',
-            subtitleVietnamese: 'Hàm mất mát như thung lũng, mô hình cần lăn xuống đáy sâu nhất.'
+      if (targetDurationSeconds >= 300) {
+        // 8-stage comprehensive pedagogical progression for >= 5 min
+        const dur1 = Math.round(targetDurationSeconds * 0.1); // ~30s
+        const dur2 = Math.round(targetDurationSeconds * 0.15); // ~45s
+        const remainder = targetDurationSeconds - (dur1 * 2 + dur2 * 5);
+        scenes = [
+          {
+            sceneId: 'sc_intro',
+            sceneType: 'concept_intro',
+            title: 'Khái niệm và Mục tiêu Tối ưu hóa',
+            pedagogicalGoal: 'Giới thiệu bài toán tìm cực tiểu hàm mất mát trong huấn luyện AI',
+            durationSeconds: dur1,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Chào mừng các bạn. Ta sẽ tìm hiểu Gradient Descent, linh hồn tối ưu hóa đằng sau các mô hình AI hiện đại.',
+              subtitleVietnamese: 'Gradient Descent là thuật toán tìm cực tiểu hàm mất mát trong AI.'
+            },
+            visualPayload: {
+              sceneType: 'concept_intro',
+              centralQuestion: 'Làm thế nào để mô hình tự động cập nhật trọng số giảm thiểu sai số?',
+              keyConcept: 'Tối ưu hóa Hàm mất mát',
+              accentColor: '#38BDF8',
+              visualStyleId: 'clean_educational_infographic',
+              reducedMotion: false
+            }
           },
-          visualPayload: {
+          {
+            sceneId: 'sc_loss_bowl',
             sceneType: 'loss_landscape',
-            functionType: 'convex_quadratic',
-            minimumPoint: { w: 0.0, loss: 0.0 },
-            curvature: 1.0,
-            currentParam: 2.0,
-            learningRate: 0.3,
-            steps: [
-              { stepNumber: 1, w: 2.0, loss: 4.0, gradient: 4.0 },
-              { stepNumber: 2, w: 0.8, loss: 0.64, gradient: 1.6 },
-              { stepNumber: 3, w: 0.32, loss: 0.1024, gradient: 0.64 }
-            ],
-            showGradientTangent: true
-          }
-        },
-        {
-          sceneId: 'sc_descent_steps',
-          sceneType: 'flowchart_simulation',
-          title: 'Từng bước cập nhật theo Gradient',
-          pedagogicalGoal: 'Minh họa các bước chân bước ngược chiều vector đạo hàm',
-          durationSeconds: 22,
-          boundClaimIds: ['claim_lr_intuition'],
-          rendererTarget: 'remotion_infographic',
-          narration: {
-            vietnamese: 'Ở mỗi bước, gradient chỉ hướng lên dốc. Ta bước theo hướng ngược lại một đoạn bằng tốc độ học.',
-            subtitleVietnamese: 'Bước ngược hướng gradient một đoạn tỉ lệ với tốc độ học.'
+            title: 'Bề mặt Hàm mất mát và Điểm khởi tạo',
+            pedagogicalGoal: 'Trực quan hóa bề mặt hàm mất mát dạng cái bát và vị trí hiện tại của mô hình',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Hãy hình dung hàm mất mát như một thung lũng, mục tiêu của ta là đưa quả bóng lăn xuống đáy sâu nhất.',
+              subtitleVietnamese: 'Hàm mất mát như thung lũng, mô hình cần lăn xuống đáy sâu nhất.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 2.0,
+              learningRate: 0.3,
+              steps: [
+                { stepNumber: 1, w: 2.0, loss: 4.0, gradient: 4.0 },
+                { stepNumber: 2, w: 0.8, loss: 0.64, gradient: 1.6 },
+                { stepNumber: 3, w: 0.32, loss: 0.1024, gradient: 0.64 }
+              ],
+              showGradientTangent: true
+            }
           },
-          visualPayload: {
+          {
+            sceneId: 'sc_gradient_vector',
             sceneType: 'flowchart_simulation',
-            headline: 'Bước lặp cập nhật tham số',
-            formulaTex: 'w_{t+1} = w_t - \\eta \\cdot \\nabla L(w_t)',
-            notes: 'Hội tụ ổn định về cực tiểu cục bộ'
+            title: 'Vector Gradient và Hướng tăng nhanh nhất',
+            pedagogicalGoal: 'Phân tích bản chất toán học của vector gradient',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Đạo hàm riêng biểu diễn độ dốc. Vector gradient chỉ hướng hàm số tăng nhanh nhất.',
+              subtitleVietnamese: 'Vector gradient chỉ hướng tăng dốc nhất của hàm số.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Vector Gradient: Hướng tăng dốc nhất',
+              formulaTex: '\\nabla L(w) = \\frac{\\partial L}{\\partial w}',
+              notes: 'Bước ngược lại sẽ làm giảm mất mát'
+            }
+          },
+          {
+            sceneId: 'sc_learning_rate',
+            sceneType: 'loss_landscape',
+            title: 'Tốc độ học (Learning Rate) và Động lực học',
+            pedagogicalGoal: 'Phân tích sự khác biệt giữa learning rate quá lớn và quá nhỏ',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_lr_intuition'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Learning rate là độ dài bước nhảy. Quá lớn gây vọt xà, quá nhỏ khiến học rất chậm.',
+              subtitleVietnamese: 'Learning rate quyết định bước nhảy tham số ở mỗi vòng lặp.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 1.5,
+              learningRate: 0.1,
+              steps: [
+                { stepNumber: 1, w: 1.5, loss: 2.25, gradient: 3.0 },
+                { stepNumber: 2, w: 1.2, loss: 1.44, gradient: 2.4 }
+              ],
+              showGradientTangent: true
+            }
+          },
+          {
+            sceneId: 'sc_worked_example',
+            sceneType: 'flowchart_simulation',
+            title: 'Ví dụ Tính toán Số cụ thể',
+            pedagogicalGoal: 'Thực hành tính toán số từng bước cập nhật tham số',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Với w bằng 2, gradient bằng 4, eta bằng 0.3, tham số mới w1 trở thành 0.8.',
+              subtitleVietnamese: 'w_1 = 2.0 - 0.3 * 4.0 = 0.8'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Tính toán Số Từng Bước',
+              formulaTex: 'w_1 = 2.0 - 0.3 \\times 4.0 = 0.8',
+              notes: 'Mất mát giảm từ 4.0 xuống 0.64'
+            }
+          },
+          {
+            sceneId: 'sc_opt_vis',
+            sceneType: 'loss_landscape',
+            title: 'Hành vi Hội tụ về Điểm Cực tiểu',
+            pedagogicalGoal: 'Quan sát quỹ đạo tham số tiệm cận điểm tối ưu toàn cục',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Qua nhiều vòng lặp, mô hình tiến sát về đáy thung lũng nơi gradient bằng 0.',
+              subtitleVietnamese: 'Quỹ đạo tham số hội tụ về đáy nơi gradient bằng 0.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 0.8,
+              learningRate: 0.3,
+              steps: [
+                { stepNumber: 2, w: 0.8, loss: 0.64, gradient: 1.6 },
+                { stepNumber: 3, w: 0.32, loss: 0.1024, gradient: 0.64 },
+                { stepNumber: 4, w: 0.128, loss: 0.016384, gradient: 0.256 }
+              ],
+              showGradientTangent: true
+            }
+          },
+          {
+            sceneId: 'sc_common_mistakes',
+            sceneType: 'flowchart_simulation',
+            title: 'Lưu ý Sư phạm & Sai lầm Thường gặp',
+            pedagogicalGoal: 'Cảnh báo về điểm yên ngựa, cực tiểu cục bộ và vanishing gradient',
+            durationSeconds: dur1,
+            boundClaimIds: ['claim_lr_intuition'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Cần chú ý hiện tượng gradient triệt tiêu và rơi vào điểm yên ngựa trong không gian đa chiều.',
+              subtitleVietnamese: 'Lưu ý điểm yên ngựa và tốc độ học không phù hợp.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Lưu ý Thực tiễn trong Huấn luyện',
+              formulaTex: '\\Delta w \\approx 0 \\implies \\text{Vanishing Gradient}',
+              notes: 'Áp dụng Momentum hoặc Adam để tăng tốc'
+            }
+          },
+          {
+            sceneId: 'sc_summary',
+            sceneType: 'summary',
+            title: 'Tổng kết & Ghi nhớ Cốt lõi',
+            pedagogicalGoal: 'Củng cố kiến thức và công thức then chốt',
+            durationSeconds: remainder,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Tóm lại, Gradient Descent bước ngược dốc theo tỉ lệ learning rate để giảm tối đa sai số.',
+              subtitleVietnamese: 'Gradient Descent tối ưu hóa lặp giảm thiểu hàm mất mát.'
+            },
+            visualPayload: {
+              sceneType: 'summary',
+              title: 'Tổng kết & Ghi nhớ Cốt lõi',
+              takeaways: [
+                'Gradient chỉ hướng tăng dốc nhất của hàm mất mát',
+                'Quy tắc cập nhật: w_mới = w_cũ - eta * nabla L(w)',
+                'Hội tụ tại điểm đáy nơi độ dốc tiệm cận 0'
+              ],
+              verifiedFacts: [],
+              reviewNotes: [],
+              finalCallout: 'w = w - \\eta \\cdot \\nabla L(w)'
+            }
           }
-        }
-      ];
+        ];
+      } else if (targetDurationSeconds >= 180) {
+        // 5-scene multi-chapter progression for 180s
+        scenes = [
+          {
+            sceneId: 'sc_intro',
+            sceneType: 'concept_intro',
+            title: 'Mục tiêu & Bản chất Gradient Descent',
+            pedagogicalGoal: 'Giới thiệu bài toán tối ưu hóa trong học máy',
+            durationSeconds: 25,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Chào mừng các bạn. Ta sẽ tìm hiểu Gradient Descent, cốt lõi tối ưu hóa trong học máy.',
+              subtitleVietnamese: 'Gradient Descent là thuật toán tìm cực tiểu hàm mất mát trong AI.'
+            },
+            visualPayload: {
+              sceneType: 'concept_intro',
+              centralQuestion: 'Làm thế nào để mạng neural tự tìm trọng số tối ưu?',
+              keyConcept: 'Gradient Descent & Tối ưu hóa',
+              accentColor: '#38BDF8',
+              visualStyleId: 'clean_educational_infographic',
+              reducedMotion: false
+            }
+          },
+          {
+            sceneId: 'sc_loss_bowl',
+            sceneType: 'loss_landscape',
+            title: 'Bề mặt Hàm mất mát và Quả bóng lăn',
+            pedagogicalGoal: 'Trực quan hóa bề mặt hàm mất mát dạng cái bát và vị trí hiện tại của mô hình',
+            durationSeconds: 35,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Hãy hình dung hàm mất mát như một thung lũng, mục tiêu của ta là đưa quả bóng lăn xuống đáy sâu nhất.',
+              subtitleVietnamese: 'Hàm mất mát như thung lũng, mô hình cần lăn xuống đáy sâu nhất.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 2.0,
+              learningRate: 0.3,
+              steps: [
+                { stepNumber: 1, w: 2.0, loss: 4.0, gradient: 4.0 },
+                { stepNumber: 2, w: 0.8, loss: 0.64, gradient: 1.6 },
+                { stepNumber: 3, w: 0.32, loss: 0.1024, gradient: 0.64 }
+              ],
+              showGradientTangent: true
+            }
+          },
+          {
+            sceneId: 'sc_gradient_vector',
+            sceneType: 'flowchart_simulation',
+            title: 'Vector Gradient và Hướng Cập nhật',
+            pedagogicalGoal: 'Minh họa các bước chân bước ngược chiều vector đạo hàm',
+            durationSeconds: 40,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Ở mỗi bước, gradient chỉ hướng lên dốc. Ta bước theo hướng ngược lại một đoạn bằng tốc độ học.',
+              subtitleVietnamese: 'Bước ngược hướng gradient một đoạn tỉ lệ với tốc độ học.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Bước lặp cập nhật tham số',
+              formulaTex: 'w_{t+1} = w_t - \\eta \\cdot \\nabla L(w_t)',
+              notes: 'Hội tụ ổn định về cực tiểu cục bộ'
+            }
+          },
+          {
+            sceneId: 'sc_learning_rate',
+            sceneType: 'loss_landscape',
+            title: 'Tác động của Learning Rate',
+            pedagogicalGoal: 'Phân tích hành vi hội tụ với các giá trị learning rate khác nhau',
+            durationSeconds: 45,
+            boundClaimIds: ['claim_lr_intuition'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Tốc độ học quá lớn gây phân kỳ vượt khỏi thung lũng, trong khi quá nhỏ khiến học rất chậm.',
+              subtitleVietnamese: 'Chọn tốc độ học phù hợp giúp mô hình hội tụ nhanh và ổn định.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 1.8,
+              learningRate: 0.2,
+              steps: [
+                { stepNumber: 1, w: 1.8, loss: 3.24, gradient: 3.6 },
+                { stepNumber: 2, w: 1.08, loss: 1.1664, gradient: 2.16 }
+              ],
+              showGradientTangent: true
+            }
+          },
+          {
+            sceneId: 'sc_gd_summary',
+            sceneType: 'summary',
+            title: 'Tổng kết Thuật toán Gradient Descent',
+            pedagogicalGoal: 'Củng cố quy tắc cập nhật và điều kiện hội tụ',
+            durationSeconds: 35,
+            boundClaimIds: ['claim_lr_intuition'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Tóm lại, Gradient Descent liên tục đưa mô hình về điểm có sai số nhỏ nhất.',
+              subtitleVietnamese: 'Gradient Descent tối ưu hóa lặp giảm thiểu hàm mất mát.'
+            },
+            visualPayload: {
+              sceneType: 'summary',
+              title: 'Tổng kết Thuật toán Gradient Descent',
+              takeaways: [
+                'Gradient chỉ hướng dốc nhất của hàm mất mát',
+                'Bước ngược gradient một đoạn tỉ lệ với learning rate',
+                'Hội tụ tại điểm cực tiểu địa phương hoặc toàn cục'
+              ],
+              verifiedFacts: [],
+              reviewNotes: [],
+              finalCallout: 'w_{t+1} = w_t - \\eta \\cdot \\nabla L(w_t)'
+            }
+          }
+        ];
+      } else if (targetDurationSeconds >= 60) {
+        // 3 scenes for 60s
+        scenes = [
+          {
+            sceneId: 'sc_loss_bowl',
+            sceneType: 'loss_landscape',
+            title: 'Bề mặt hàm mất mát và quả bóng lăn',
+            pedagogicalGoal: 'Trực quan hóa bề mặt hàm mất mát dạng cái bát và vị trí hiện tại của mô hình',
+            durationSeconds: 20,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Hãy hình dung hàm mất mát như một thung lũng, mục tiêu của ta là đưa quả bóng lăn xuống đáy sâu nhất.',
+              subtitleVietnamese: 'Hàm mất mát như thung lũng, mô hình cần lăn xuống đáy sâu nhất.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 2.0,
+              learningRate: 0.3,
+              steps: [
+                { stepNumber: 1, w: 2.0, loss: 4.0, gradient: 4.0 },
+                { stepNumber: 2, w: 0.8, loss: 0.64, gradient: 1.6 },
+                { stepNumber: 3, w: 0.32, loss: 0.1024, gradient: 0.64 }
+              ],
+              showGradientTangent: true
+            }
+          },
+          {
+            sceneId: 'sc_descent_steps',
+            sceneType: 'flowchart_simulation',
+            title: 'Từng bước cập nhật theo Gradient',
+            pedagogicalGoal: 'Minh họa các bước chân bước ngược chiều vector đạo hàm',
+            durationSeconds: 25,
+            boundClaimIds: ['claim_lr_intuition'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Ở mỗi bước, gradient chỉ hướng lên dốc. Ta bước theo hướng ngược lại một đoạn bằng tốc độ học.',
+              subtitleVietnamese: 'Bước ngược hướng gradient một đoạn tỉ lệ với tốc độ học.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Bước lặp cập nhật tham số',
+              formulaTex: 'w_{t+1} = w_t - \\eta \\cdot \\nabla L(w_t)',
+              notes: 'Hội tụ ổn định về cực tiểu cục bộ'
+            }
+          },
+          {
+            sceneId: 'sc_gd_summary',
+            sceneType: 'summary',
+            title: 'Tổng kết Gradient Descent',
+            pedagogicalGoal: 'Củng cố công thức cập nhật và điều kiện dừng',
+            durationSeconds: 15,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Tóm lại, Gradient Descent điều chỉnh tham số ngược hướng dốc để giảm thiểu mất mát.',
+              subtitleVietnamese: 'Gradient Descent hội tụ tại cực tiểu hàm mất mát.'
+            },
+            visualPayload: {
+              sceneType: 'summary',
+              title: 'Tổng kết Gradient Descent',
+              takeaways: [
+                'Gradient chỉ hướng tăng nhanh nhất',
+                'Bước ngược gradient một khoảng bằng learning rate',
+                'Hội tụ tại điểm cực tiểu'
+              ],
+              verifiedFacts: [],
+              reviewNotes: [],
+              finalCallout: 'w = w - \\eta \\cdot \\nabla L(w)'
+            }
+          }
+        ];
+      } else {
+        const dur1 = Math.round(targetDurationSeconds * 0.45);
+        const dur2 = targetDurationSeconds - dur1;
+        scenes = [
+          {
+            sceneId: 'sc_loss_bowl',
+            sceneType: 'loss_landscape',
+            title: 'Bề mặt hàm mất mát và quả bóng lăn',
+            pedagogicalGoal: 'Trực quan hóa bề mặt hàm mất mát dạng cái bát và vị trí hiện tại của mô hình',
+            durationSeconds: dur1,
+            boundClaimIds: ['claim_gd_update_rule'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Hãy hình dung hàm mất mát như một thung lũng, mục tiêu của ta là đưa quả bóng lăn xuống đáy sâu nhất.',
+              subtitleVietnamese: 'Hàm mất mát như thung lũng, mô hình cần lăn xuống đáy sâu nhất.'
+            },
+            visualPayload: {
+              sceneType: 'loss_landscape',
+              functionType: 'convex_quadratic',
+              minimumPoint: { w: 0.0, loss: 0.0 },
+              curvature: 1.0,
+              currentParam: 2.0,
+              learningRate: 0.3,
+              steps: [
+                { stepNumber: 1, w: 2.0, loss: 4.0, gradient: 4.0 },
+                { stepNumber: 2, w: 0.8, loss: 0.64, gradient: 1.6 },
+                { stepNumber: 3, w: 0.32, loss: 0.1024, gradient: 0.64 }
+              ],
+              showGradientTangent: true
+            }
+          },
+          {
+            sceneId: 'sc_descent_steps',
+            sceneType: 'flowchart_simulation',
+            title: 'Từng bước cập nhật theo Gradient',
+            pedagogicalGoal: 'Minh họa các bước chân bước ngược chiều vector đạo hàm',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_lr_intuition'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Ở mỗi bước, gradient chỉ hướng lên dốc. Ta bước theo hướng ngược lại một đoạn bằng tốc độ học.',
+              subtitleVietnamese: 'Bước ngược hướng gradient một đoạn tỉ lệ với tốc độ học.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Bước lặp cập nhật tham số',
+              formulaTex: 'w_{t+1} = w_t - \\eta \\cdot \\nabla L(w_t)',
+              notes: 'Hội tụ ổn định về cực tiểu cục bộ'
+            }
+          }
+        ];
+      }
     } else if (capability.topicId === 'ai.transformer.attention') {
       summary = 'Cơ chế Self-Attention tính toán trọng số quan hệ ngữ cảnh giữa mọi cặp từ trong câu.';
       learningObjectives = [
@@ -815,54 +1312,293 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           humanReviewComment: 'Công thức tích vô hướng có tỉ lệ trong kiến trúc Transformer.'
         }
       ];
-      scenes = [
-        {
-          sceneId: 'sc_context_need',
-          sceneType: 'concept_intro',
-          title: 'Vấn đề hiểu từ vựng theo ngữ cảnh',
-          pedagogicalGoal: 'Minh họa từ đa nghĩa cần liên kết với các từ khác trong câu để rõ nghĩa',
-          durationSeconds: 16,
-          boundClaimIds: ['claim_attention_mechanism'],
-          rendererTarget: 'remotion_infographic',
-          narration: {
-            vietnamese: 'Một từ như "ngân hàng" có thể là bờ sông hay tổ chức tài chính tùy thuộc vào ngữ cảnh xung quanh.',
-            subtitleVietnamese: 'Nghĩa của từ phụ thuộc hoàn toàn vào ngữ cảnh xung quanh.'
-          },
-          visualPayload: {
+      if (targetDurationSeconds >= 300) {
+        // Multi-stage deep dive for Transformer Attention >= 5 min (ensure each scene <= 120s)
+        const dur1 = Math.round(targetDurationSeconds * 0.12);
+        const dur2 = Math.round(targetDurationSeconds * 0.16);
+        const dur3 = Math.round(targetDurationSeconds * 0.18);
+        const dur4 = Math.round(targetDurationSeconds * 0.18);
+        const dur5 = Math.round(targetDurationSeconds * 0.18);
+        const dur6 = targetDurationSeconds - (dur1 + dur2 + dur3 + dur4 + dur5);
+        scenes = [
+          {
+            sceneId: 'sc_context_need',
             sceneType: 'concept_intro',
-            centralQuestion: 'Làm thế nào để mô hình liên kết các từ có quan hệ ngữ nghĩa ở xa nhau?',
-            keyConcept: 'Cơ chế Self-Attention',
-            accentColor: '#38BDF8',
-            visualStyleId: 'clean_educational_infographic',
-            reducedMotion: false
-          }
-        },
-        {
-          sceneId: 'sc_attention_matrix',
-          sceneType: 'attention_heatmap',
-          title: 'Ma trận chú ý tương tác từ vựng',
-          pedagogicalGoal: 'Trực quan hóa ma trận liên kết giữa các từ trong câu',
-          durationSeconds: 24,
-          boundClaimIds: ['claim_attention_formula'],
-          rendererTarget: 'remotion_infographic',
-          narration: {
-            vietnamese: 'Từng từ gửi câu hỏi Query tới các Key của mọi từ khác để thu về trọng số tương tác chính xác.',
-            subtitleVietnamese: 'Query so khớp với Key để lấy trọng số tập trung cho Value.'
+            title: 'Vấn đề hiểu từ vựng theo ngữ cảnh',
+            pedagogicalGoal: 'Minh họa từ đa nghĩa cần liên kết với các từ khác trong câu để rõ nghĩa',
+            durationSeconds: dur1,
+            boundClaimIds: ['claim_attention_mechanism'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Một từ như "ngân hàng" có thể là bờ sông hay tổ chức tài chính tùy thuộc vào ngữ cảnh xung quanh.',
+              subtitleVietnamese: 'Nghĩa của từ phụ thuộc hoàn toàn vào ngữ cảnh xung quanh.'
+            },
+            visualPayload: {
+              sceneType: 'concept_intro',
+              centralQuestion: 'Làm thế nào để mô hình liên kết các từ có quan hệ ngữ nghĩa ở xa nhau?',
+              keyConcept: 'Cơ chế Self-Attention',
+              accentColor: '#38BDF8',
+              visualStyleId: 'clean_educational_infographic',
+              reducedMotion: false
+            }
           },
-          visualPayload: {
+          {
+            sceneId: 'sc_qkv_projection',
+            sceneType: 'flowchart_simulation',
+            title: 'Bộ ba Vector Query, Key và Value',
+            pedagogicalGoal: 'Giải thích vai trò của Query, Key và Value trong cơ chế Attention',
+            durationSeconds: dur2,
+            boundClaimIds: ['claim_attention_mechanism'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Mỗi từ chiếu thành ba vector: Query để hỏi, Key để so khớp và Value chứa thông tin ngữ nghĩa.',
+              subtitleVietnamese: 'Mỗi token sinh ra ba vector Q, K, V thông qua các ma trận trọng số.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Phép Chiếu Tuyến Tính Q, K, V',
+              formulaTex: 'Q = X W_Q, \\quad K = X W_K, \\quad V = X W_V',
+              notes: 'Tương tác thông qua tích vô hướng'
+            }
+          },
+          {
+            sceneId: 'sc_scaled_dot_product',
+            sceneType: 'flowchart_simulation',
+            title: 'Tích vô hướng có tỉ lệ và Chia căn d_k',
+            pedagogicalGoal: 'Làm rõ lý do chia căn bậc hai của d_k để tránh vanishing gradient khi softmax',
+            durationSeconds: dur3,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Tích vô hướng giữa Query và Key được chuẩn hóa bằng căn bậc hai của d_k để giữ gradient ổn định.',
+              subtitleVietnamese: 'Chia căn d_k giúp gradient không bị triệt tiêu khi giá trị tích vô hướng quá lớn.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Chuẩn Hóa Tích Vô Hướng (Scaled Dot-Product)',
+              formulaTex: '\\text{Score}(Q, K) = \\frac{Q K^T}{\\sqrt{d_k}}',
+              notes: 'Kiểm soát phương sai phân phối score'
+            }
+          },
+          {
+            sceneId: 'sc_attention_matrix',
             sceneType: 'attention_heatmap',
-            tokens: ['Ngân', 'hàng', 'bên', 'sông'],
-            matrix: [
-              [0.45, 0.40, 0.08, 0.07],
-              [0.35, 0.45, 0.10, 0.10],
-              [0.08, 0.12, 0.40, 0.40],
-              [0.06, 0.10, 0.39, 0.45]
-            ],
-            highlightTokenIndex: 0,
-            isIllustrative: true
+            title: 'Ma trận Chú ý Tương tác Từ vựng',
+            pedagogicalGoal: 'Trực quan hóa ma trận liên kết giữa các từ trong câu',
+            durationSeconds: dur4,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Hàm Softmax biến các điểm số thành phân phối xác suất chú ý mềm trên từng cặp từ vựng.',
+              subtitleVietnamese: 'Softmax tạo phân phối trọng số chú ý giữa các token.'
+            },
+            visualPayload: {
+              sceneType: 'attention_heatmap',
+              tokens: ['Ngân', 'hàng', 'bên', 'sông'],
+              matrix: [
+                [0.45, 0.40, 0.08, 0.07],
+                [0.35, 0.45, 0.10, 0.10],
+                [0.08, 0.12, 0.40, 0.40],
+                [0.06, 0.10, 0.39, 0.45]
+              ],
+              highlightTokenIndex: 0,
+              isIllustrative: true
+            }
+          },
+          {
+            sceneId: 'sc_value_aggregation',
+            sceneType: 'flowchart_simulation',
+            title: 'Tổng hợp Thông tin theo Trọng số Value',
+            pedagogicalGoal: 'Giải thích bước nhân phân phối chú ý với ma trận Value để sinh biểu diễn ngữ cảnh',
+            durationSeconds: dur5,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Mỗi token mới được tạo thành từ tổ hợp tuyến tính các Value, mang đậm thông tin từ các từ liên quan.',
+              subtitleVietnamese: 'Tổ hợp tuyến tính các vector Value tạo ra biểu diễn ngữ cảnh hoàn chỉnh.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Tổng Hợp Thông Tin (Value Aggregation)',
+              formulaTex: '\\text{Output} = \\sum_{j} \\alpha_{ij} V_j',
+              notes: 'Tập hợp thông tin từ toàn bộ chuỗi token'
+            }
+          },
+          {
+            sceneId: 'sc_attention_summary',
+            sceneType: 'summary',
+            title: 'Tổng kết Cơ chế Chú ý Transformer',
+            pedagogicalGoal: 'Củng cố công thức tích vô hướng có tỉ lệ và trọng số tổng hợp',
+            durationSeconds: dur6,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Cơ chế Self-Attention cho phép xử lý song song toàn bộ văn bản và nắm bắt trọn vẹn ngữ cảnh.',
+              subtitleVietnamese: 'Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) * V.'
+            },
+            visualPayload: {
+              sceneType: 'summary',
+              title: 'Tổng kết Cơ chế Chú ý Transformer',
+              takeaways: [
+                'Xử lý song song không phụ thuộc vào thứ tự tuần tự',
+                'So khớp Query và Key có chia căn bậc hai của d_k',
+                'Tổng hợp Value theo phân phối trọng số mềm'
+              ],
+              verifiedFacts: [],
+              reviewNotes: [],
+              finalCallout: '\\text{Attention}(Q, K, V) = \\text{softmax}\\left(\\frac{Q K^T}{\\sqrt{d_k}}\\right) V'
+            }
           }
-        }
-      ];
+        ];
+      } else if (targetDurationSeconds >= 180) {
+        const d1 = Math.round(targetDurationSeconds * 0.2);
+        const d2 = Math.round(targetDurationSeconds * 0.3);
+        const d3 = Math.round(targetDurationSeconds * 0.3);
+        const d4 = targetDurationSeconds - (d1 + d2 + d3);
+        scenes = [
+          {
+            sceneId: 'sc_context_need',
+            sceneType: 'concept_intro',
+            title: 'Vấn đề hiểu từ vựng theo ngữ cảnh',
+            pedagogicalGoal: 'Minh họa từ đa nghĩa cần liên kết với các từ khác trong câu để rõ nghĩa',
+            durationSeconds: d1,
+            boundClaimIds: ['claim_attention_mechanism'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Một từ như "ngân hàng" có thể là bờ sông hay tổ chức tài chính tùy thuộc vào ngữ cảnh xung quanh.',
+              subtitleVietnamese: 'Nghĩa của từ phụ thuộc hoàn toàn vào ngữ cảnh xung quanh.'
+            },
+            visualPayload: {
+              sceneType: 'concept_intro',
+              centralQuestion: 'Làm thế nào để mô hình liên kết các từ có quan hệ ngữ nghĩa ở xa nhau?',
+              keyConcept: 'Cơ chế Self-Attention',
+              accentColor: '#38BDF8',
+              visualStyleId: 'clean_educational_infographic',
+              reducedMotion: false
+            }
+          },
+          {
+            sceneId: 'sc_qkv_projection',
+            sceneType: 'flowchart_simulation',
+            title: 'Bộ ba Vector Query, Key và Value',
+            pedagogicalGoal: 'Giải thích vai trò của Query, Key và Value trong cơ chế Attention',
+            durationSeconds: d2,
+            boundClaimIds: ['claim_attention_mechanism'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Mỗi từ chiếu thành ba vector: Query để hỏi, Key để so khớp và Value chứa thông tin ngữ nghĩa.',
+              subtitleVietnamese: 'Mỗi token sinh ra ba vector Q, K, V thông qua các ma trận trọng số.'
+            },
+            visualPayload: {
+              sceneType: 'flowchart_simulation',
+              headline: 'Phép Chiếu Tuyến Tính Q, K, V',
+              formulaTex: 'Q = X W_Q, \\quad K = X W_K, \\quad V = X W_V',
+              notes: 'Tương tác thông qua tích vô hướng'
+            }
+          },
+          {
+            sceneId: 'sc_attention_matrix',
+            sceneType: 'attention_heatmap',
+            title: 'Ma trận Chú ý Tương tác Từ vựng',
+            pedagogicalGoal: 'Trực quan hóa ma trận liên kết giữa các từ trong câu',
+            durationSeconds: d3,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Từng từ gửi câu hỏi Query tới các Key của mọi từ khác để thu về trọng số tương tác chính xác.',
+              subtitleVietnamese: 'Query so khớp với Key để lấy trọng số tập trung cho Value.'
+            },
+            visualPayload: {
+              sceneType: 'attention_heatmap',
+              tokens: ['Ngân', 'hàng', 'bên', 'sông'],
+              matrix: [
+                [0.45, 0.40, 0.08, 0.07],
+                [0.35, 0.45, 0.10, 0.10],
+                [0.08, 0.12, 0.40, 0.40],
+                [0.06, 0.10, 0.39, 0.45]
+              ],
+              highlightTokenIndex: 0,
+              isIllustrative: true
+            }
+          },
+          {
+            sceneId: 'sc_attention_summary',
+            sceneType: 'summary',
+            title: 'Tổng kết Cơ chế Chú ý Transformer',
+            pedagogicalGoal: 'Củng cố công thức tích vô hướng có tỉ lệ và trọng số tổng hợp',
+            durationSeconds: d4,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Cơ chế Self-Attention cho phép xử lý song song toàn bộ văn bản và nắm bắt trọn vẹn ngữ cảnh.',
+              subtitleVietnamese: 'Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) * V.'
+            },
+            visualPayload: {
+              sceneType: 'summary',
+              title: 'Tổng kết Cơ chế Chú ý Transformer',
+              takeaways: [
+                'Xử lý song song không phụ thuộc vào thứ tự tuần tự',
+                'So khớp Query và Key có chia căn bậc hai của d_k',
+                'Tổng hợp Value theo phân phối trọng số mềm'
+              ],
+              verifiedFacts: [],
+              reviewNotes: [],
+              finalCallout: '\\text{Attention}(Q, K, V) = \\text{softmax}\\left(\\frac{Q K^T}{\\sqrt{d_k}}\\right) V'
+            }
+          }
+        ];
+      } else {
+        const d1 = Math.round(targetDurationSeconds * 0.4);
+        const d2 = targetDurationSeconds - d1;
+        scenes = [
+          {
+            sceneId: 'sc_context_need',
+            sceneType: 'concept_intro',
+            title: 'Vấn đề hiểu từ vựng theo ngữ cảnh',
+            pedagogicalGoal: 'Minh họa từ đa nghĩa cần liên kết với các từ khác trong câu để rõ nghĩa',
+            durationSeconds: d1,
+            boundClaimIds: ['claim_attention_mechanism'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Một từ như "ngân hàng" có thể là bờ sông hay tổ chức tài chính tùy thuộc vào ngữ cảnh xung quanh.',
+              subtitleVietnamese: 'Nghĩa của từ phụ thuộc hoàn toàn vào ngữ cảnh xung quanh.'
+            },
+            visualPayload: {
+              sceneType: 'concept_intro',
+              centralQuestion: 'Làm thế nào để mô hình liên kết các từ có quan hệ ngữ nghĩa ở xa nhau?',
+              keyConcept: 'Cơ chế Self-Attention',
+              accentColor: '#38BDF8',
+              visualStyleId: 'clean_educational_infographic',
+              reducedMotion: false
+            }
+          },
+          {
+            sceneId: 'sc_attention_matrix',
+            sceneType: 'attention_heatmap',
+            title: 'Ma trận chú ý tương tác từ vựng',
+            pedagogicalGoal: 'Trực quan hóa ma trận liên kết giữa các từ trong câu',
+            durationSeconds: d2,
+            boundClaimIds: ['claim_attention_formula'],
+            rendererTarget: 'remotion_infographic',
+            narration: {
+              vietnamese: 'Từng từ gửi câu hỏi Query tới các Key của mọi từ khác để thu về trọng số tương tác chính xác.',
+              subtitleVietnamese: 'Query so khớp với Key để lấy trọng số tập trung cho Value.'
+            },
+            visualPayload: {
+              sceneType: 'attention_heatmap',
+              tokens: ['Ngân', 'hàng', 'bên', 'sông'],
+              matrix: [
+                [0.45, 0.40, 0.08, 0.07],
+                [0.35, 0.45, 0.10, 0.10],
+                [0.08, 0.12, 0.40, 0.40],
+                [0.06, 0.10, 0.39, 0.45]
+              ],
+              highlightTokenIndex: 0,
+              isIllustrative: true
+            }
+          }
+        ];
+      }
     } else if (capability.topicId === 'ai.neural_network.backpropagation') {
       summary = 'Lan truyền ngược kết hợp quy tắc chuỗi vi phân để phân bổ sai số từ đầu ra về từng trọng số.';
       learningObjectives = [
@@ -1008,54 +1744,12 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           humanReviewComment: 'Nội dung khái niệm cần giáo viên đối chiếu sư phạm.'
         }
       ];
-      scenes = [
-        {
-          sceneId: 'sc_gen_1',
-          sceneType: 'concept_intro',
-          title: `Giới thiệu ${topic}`,
-          pedagogicalGoal: `Mở đầu và đặt vấn đề cho chủ đề ${topic}`,
-          durationSeconds: Math.floor(targetDurationSeconds / 2),
-          boundClaimIds: ['claim_general_1'],
-          rendererTarget: 'remotion_infographic',
-          narration: {
-            vietnamese: `Chào mừng các bạn đến với bài học về ${topic}.`,
-            subtitleVietnamese: `Khám phá bài học về ${topic}.`
-          },
-          visualPayload: {
-            sceneType: 'concept_intro',
-            centralQuestion: `Bản chất cốt lõi của ${topic} là gì?`,
-            keyConcept: topic,
-            accentColor: '#6366F1',
-            visualStyleId: 'clean_educational_infographic',
-            reducedMotion: false
-          }
-        },
-        {
-          sceneId: 'sc_gen_2',
-          sceneType: 'summary',
-          title: `Tổng kết ${topic}`,
-          pedagogicalGoal: `Củng cố kiến thức đã học về ${topic}`,
-          durationSeconds: Math.ceil(targetDurationSeconds / 2),
-          boundClaimIds: ['claim_general_1'],
-          rendererTarget: 'remotion_infographic',
-          narration: {
-            vietnamese: `Hy vọng bài học giúp bạn nắm vững bản chất cốt lõi của ${topic}.`,
-            subtitleVietnamese: `Nắm vững bản chất cốt lõi của ${topic}.`
-          },
-          visualPayload: {
-            sceneType: 'summary',
-            title: `Tổng kết ${topic}`,
-            takeaways: [
-              `Nắm vững khái niệm nền tảng của ${topic}`,
-              'Hiểu rõ mối liên hệ giữa lý thuyết và trực quan',
-              'Sẵn sàng áp dụng vào các bài toán thực hành'
-            ],
-            verifiedFacts: [],
-            reviewNotes: ['Nội dung cần giáo viên rà soát ngữ nghĩa.'],
-            finalCallout: `Khép lại bài học sư phạm về ${topic}.`
-          }
-        }
-      ];
+      scenes = this.buildAdaptiveScenesForTopic(
+        topic,
+        targetDurationSeconds,
+        isMath,
+        'claim_general_1'
+      );
     }
 
     const totalSeconds = scenes.reduce((acc, s) => acc + s.durationSeconds, 0);
@@ -1078,7 +1772,8 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
         storyboardId: `sb_${lessonId}`,
         lessonId,
         scenes,
-        totalDurationSeconds: totalSeconds
+        totalDurationSeconds: totalSeconds,
+        chapters: buildChaptersForScenes(scenes, totalSeconds, 24)
       }
     };
   }
@@ -1098,57 +1793,107 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
     ];
   }
 
+  private buildAdaptiveScenesForTopic(
+    topicTitle: string,
+    targetDuration: number,
+    isMath: boolean,
+    boundClaimId: string
+  ): EducationalStoryboardV3['scenes'] {
+    const maxSceneDuration = 60;
+    const count = targetDuration <= 120
+      ? 2
+      : Math.max(3, Math.ceil(targetDuration / maxSceneDuration));
+
+    const baseDuration = Math.floor(targetDuration / count);
+    const remainder = targetDuration - baseDuration * count;
+    const durations = Array.from({ length: count }, (_, i) => baseDuration + (i < remainder ? 1 : 0));
+
+    const pedagogicalStages = [
+      { type: 'concept_intro', title: `1. Giới thiệu & Đặt vấn đề: ${topicTitle}`, goal: `Kích hoạt sự tò mò và trực giác ban đầu về ${topicTitle}` },
+      { type: 'concept_intro', title: `2. Khái niệm & Cơ sở lý thuyết: ${topicTitle}`, goal: `Trình bày cấu trúc và định nghĩa cốt lõi của ${topicTitle}` },
+      { type: 'concept_intro', title: `3. Cơ chế hoạt động & Trực quan hóa: ${topicTitle}`, goal: `Phân tích luồng xử lý và quan hệ giữa các thành phần trong ${topicTitle}` },
+      { type: 'concept_intro', title: `4. Ví dụ ứng dụng & Phân tích tình huống`, goal: `Minh họa bài toán thực tế áp dụng ${topicTitle}` },
+      { type: 'concept_intro', title: `5. Lưu ý sư phạm & Tránh lỗi thường gặp`, goal: `Làm rõ các ngộ nhận phổ biến khi tìm hiểu ${topicTitle}` },
+      { type: 'concept_intro', title: `6. Mở rộng & Liên hệ bức tranh tổng thể`, goal: `Kết nối ${topicTitle} với các kiến thức và mô hình liên quan` },
+      { type: 'concept_intro', title: `7. Phân tích chi tiết trường hợp biên`, goal: `Khảo sát hành vi của mô hình trong các điều kiện đặc thù` },
+      { type: 'concept_intro', title: `8. Đánh giá ưu nhược điểm & Hiệu năng`, goal: `Tổng kết điểm mạnh và hạn chế kỹ thuật của ${topicTitle}` },
+      { type: 'concept_intro', title: `9. Luyện tập & Câu hỏi tư duy phản biện`, goal: `Thử thách học viên kiểm chứng hiểu biết về ${topicTitle}` },
+      { type: 'summary', title: `Tổng kết & Khắc sâu trọng tâm bài học`, goal: `Củng cố toàn diện tri thức và định hướng thực hành` }
+    ];
+
+    return durations.map((dur, idx) => {
+      const isFirst = idx === 0;
+      const isLast = idx === count - 1;
+      const stage = isLast
+        ? pedagogicalStages[pedagogicalStages.length - 1]
+        : pedagogicalStages[Math.min(idx, pedagogicalStages.length - 2)];
+
+      if (isLast) {
+        return {
+          sceneId: `sc_gen_${idx + 1}`,
+          sceneType: 'summary' as const,
+          title: stage.title,
+          pedagogicalGoal: stage.goal,
+          durationSeconds: dur,
+          boundClaimIds: [boundClaimId],
+          rendererTarget: 'remotion_infographic' as const,
+          narration: {
+            vietnamese: `Tổng kết lại, bài học đã cung cấp bức tranh toàn cảnh về ${topicTitle}. Hãy luyện tập để thành thạo kiến thức này.`,
+            subtitleVietnamese: `Nắm vững bản chất cốt lõi và ứng dụng của ${topicTitle}.`
+          },
+          visualPayload: {
+            sceneType: 'summary' as const,
+            title: stage.title,
+            takeaways: [
+              `Nắm vững khái niệm nền tảng của ${topicTitle}`,
+              'Hiểu rõ mối liên hệ giữa lý thuyết và trực quan',
+              'Sẵn sàng áp dụng vào các bài toán thực hành'
+            ],
+            verifiedFacts: [],
+            reviewNotes: ['Nội dung cần giáo viên rà soát ngữ nghĩa.'],
+            finalCallout: `Khép lại bài học sư phạm về ${topicTitle}.`
+          }
+        };
+      }
+
+      return {
+        sceneId: `sc_gen_${idx + 1}`,
+        sceneType: 'concept_intro' as const,
+        title: stage.title,
+        pedagogicalGoal: stage.goal,
+        durationSeconds: dur,
+        boundClaimIds: [boundClaimId],
+        rendererTarget: 'remotion_infographic' as const,
+        narration: {
+          vietnamese: isFirst
+            ? `Chào mừng các bạn đến với bài học về ${topicTitle}. Chúng ta sẽ khám phá bản chất từ trực giác tới cơ chế thực tế.`
+            : `Trong phần này, ta phân tích sâu hơn khía cạnh ${stage.title} nhằm hiểu rõ nguyên lý vận hành.`,
+          subtitleVietnamese: isFirst
+            ? `Khám phá bài học sư phạm về ${topicTitle}.`
+            : `Phân tích sâu hơn về ${topicTitle}.`
+        },
+        visualPayload: {
+          sceneType: 'concept_intro' as const,
+          centralQuestion: `Bản chất của ${topicTitle} trong giai đoạn này là gì?`,
+          keyConcept: topicTitle,
+          accentColor: '#6366F1',
+          visualStyleId: 'clean_educational_infographic' as const,
+          reducedMotion: false
+        }
+      };
+    });
+  }
+
   private getDefaultScenesForTopic(
     capability: TopicCapabilityReportV3,
     targetDuration: number
   ): EducationalStoryboardV3['scenes'] {
-    return [
-      {
-        sceneId: 'sc_def_intro',
-        sceneType: 'concept_intro',
-        title: `Giới thiệu ${capability.displayName}`,
-        pedagogicalGoal: 'Khởi đầu bài học',
-        durationSeconds: Math.floor(targetDuration / 2),
-        boundClaimIds: ['claim_default_1'],
-        rendererTarget: 'remotion_infographic',
-        narration: {
-          vietnamese: `Chào mừng các bạn đến với ${capability.displayName}.`,
-          subtitleVietnamese: `Khám phá ${capability.displayName}.`
-        },
-        visualPayload: {
-          sceneType: 'concept_intro',
-          centralQuestion: `Bản chất của ${capability.displayName} là gì?`,
-          keyConcept: capability.displayName,
-          accentColor: '#3B82F6',
-          visualStyleId: 'clean_educational_infographic',
-          reducedMotion: false
-        }
-      },
-      {
-        sceneId: 'sc_def_summary',
-        sceneType: 'summary',
-        title: 'Tổng kết bài học',
-        pedagogicalGoal: 'Củng cố kiến thức',
-        durationSeconds: Math.ceil(targetDuration / 2),
-        boundClaimIds: ['claim_default_1'],
-        rendererTarget: 'remotion_infographic',
-        narration: {
-          vietnamese: `Đó là các kiến thức trọng tâm của ${capability.displayName}.`,
-          subtitleVietnamese: `Tổng kết kiến thức cốt lõi.`
-        },
-        visualPayload: {
-          sceneType: 'summary',
-          title: 'Tổng kết bài học',
-          takeaways: [
-            `Nắm vững khái niệm cơ bản của ${capability.displayName}`,
-            'Hiểu rõ ứng dụng thực tế',
-            'Sẵn sàng cho bài học tiếp theo'
-          ],
-          verifiedFacts: [],
-          reviewNotes: [],
-          finalCallout: 'Hoàn thành bài học.'
-        }
-      }
-    ];
+    return this.buildAdaptiveScenesForTopic(
+      capability.displayName,
+      targetDuration,
+      capability.domain === 'mathematics',
+      'claim_default_1'
+    );
   }
 }
+

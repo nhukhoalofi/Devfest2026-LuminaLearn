@@ -7,9 +7,11 @@ import {
   GeminiRequestBudget,
   type GeminiRequestBudgetSummary,
   classifyGeminiError as classifySharedGeminiError,
-  computeBackoffWithJitterMs
+  computeBackoffWithJitterMs,
+  type ExternalApiConsentRecordV3,
+  verifyExternalApiConsentV3
 } from '@luminalearn/scene-schema';
-import type { TtsProvider } from './audio';
+import type { TtsProvider, TtsSynthesisSettings } from './audio';
 
 export interface GeminiSpeechRequest {
   model: string;
@@ -126,6 +128,7 @@ export interface GeminiTtsProviderOptions {
   retryBaseDelayMs?: number;
   requestBudget?: GeminiRequestBudget;
   randomFn?: () => number;
+  consentRecord?: ExternalApiConsentRecordV3;
 }
 
 const SUPPORTED_GEMINI_TTS_MODELS = new Set([
@@ -192,6 +195,7 @@ function parseAudioFormat(response: GeminiSpeechResponse, bytes: Buffer): {
 
 export class GeminiTtsProvider implements TtsProvider {
   readonly id = 'gemini_tts';
+  readonly requiresExternalConsent = true;
   readonly model: string;
   readonly voice: string;
   readonly languageCode: string;
@@ -202,10 +206,12 @@ export class GeminiTtsProvider implements TtsProvider {
   private readonly retryBaseDelayMs: number;
   private readonly budget: GeminiRequestBudget;
   private readonly randomFn: () => number;
+  private readonly consentRecord?: ExternalApiConsentRecordV3;
   private modelAvailability?: Promise<void>;
 
   constructor(options: GeminiTtsProviderOptions = {}) {
     this.apiKey = options.apiKey ?? process.env.GEMINI_API_KEY;
+    this.consentRecord = options.consentRecord;
     this.model = options.model ?? process.env.GEMINI_TTS_MODEL ?? 'gemini-3.8-flash-lite-tts';
     this.voice = options.voice ?? process.env.GEMINI_TTS_VOICE ?? 'Kore';
     const configuredLanguage = options.language ?? process.env.GEMINI_TTS_LANGUAGE ?? 'vi';
@@ -242,10 +248,23 @@ export class GeminiTtsProvider implements TtsProvider {
     return this.modelAvailability;
   }
 
-  async synthesize(text: string, outputPath: string): Promise<void> {
+  async synthesize(text: string, outputPath: string, settings?: TtsSynthesisSettings): Promise<void> {
     const narration = text.trim();
     if (!narration || narration.length > 5_000) throw new Error('tts_invalid_text: Narration must contain 1 to 5000 characters');
     if (extname(outputPath).toLowerCase() !== '.mp3') throw new Error('tts_output_invalid: Gemini TTS output path must end in .mp3');
+
+    if (this.consentRecord) {
+      const check = verifyExternalApiConsentV3({
+        consent: this.consentRecord,
+        ownerId: this.consentRecord.ownerId,
+        expectedProvider: 'gemini',
+        expectedOperation: 'narration',
+        isLiveOperation: true
+      });
+      if (!check.valid) {
+        throw new Error(`tts_consent_invalid: ${check.reason || 'Invalid external API consent record for Gemini TTS'}`);
+      }
+    }
 
     try {
       await this.ensureModelAvailable();
@@ -267,8 +286,8 @@ export class GeminiTtsProvider implements TtsProvider {
         response = await this.withTimeout((signal) => this.client.generateSpeech({
           model: this.model,
           text: narration,
-          voice: this.voice,
-          languageCode: this.languageCode,
+          voice: settings?.voice ?? this.voice,
+          languageCode: settings?.languageCode ?? this.languageCode,
           styleInstruction: 'Giọng giáo viên Việt Nam tự nhiên, rõ ràng, tốc độ vừa phải. Đọc nguyên văn nội dung.',
           signal
         }));
