@@ -1,4 +1,5 @@
 import {
+  GeminiRequestBudget,
   NarrationPlanV2Schema,
   type LessonPlanV2,
   type NarrationPlanV2,
@@ -6,7 +7,10 @@ import {
   type PronunciationHintV2,
   type StoryboardV2
 } from '@luminalearn/scene-schema';
+import { narrationPlanV2JsonSchema } from '../json-schemas';
 import type { AIProvider } from './ai-provider';
+import { verifyNarrationAndStoryboardMathConsistency } from './math-verifier';
+import type { ProviderCallTrace } from './types';
 
 export class NarrationPlannerV2 {
   public async plan(options: {
@@ -16,18 +20,57 @@ export class NarrationPlannerV2 {
     language?: 'vi' | 'en';
     fps?: number;
     aiProvider?: AIProvider;
+    requestBudget?: GeminiRequestBudget;
+    onProviderCall?: (trace: ProviderCallTrace) => void;
   }): Promise<NarrationPlanV2> {
-    const { planId, lessonPlan, storyboard, aiProvider } = options;
+    const { planId, lessonPlan, storyboard, aiProvider, requestBudget } = options;
     const language = options.language ?? 'vi';
     const fps = options.fps ?? 24;
 
     if (aiProvider && !aiProvider.isMock) {
+      const verifiedClaims = lessonPlan.mathematicalClaims.filter((claim) => claim.verificationStatus === 'verified');
+      if (verifiedClaims.length !== lessonPlan.mathematicalClaims.length) throw new Error('narration_requires_verified_claims');
+      const sceneContext = storyboard.scenes.map((scene, index) => ({
+        sceneId: scene.sceneId,
+        sceneGoal: lessonPlan.pedagogicalSequence[index]?.pedagogicalGoal ?? String(scene.parameters.title ?? scene.templateId),
+        durationFrames: scene.durationFrames,
+        boundClaimIds: scene.mathematicalBinding.boundClaimIds
+      }));
       const result = await aiProvider.generateStructured<NarrationPlanV2>({
         purpose: 'narration_planning',
-        systemPrompt: `You are an expert voiceover and narration writer for LuminaLearn STEM video lessons. Language: ${language}.`,
-        userPrompt: `Generate a NarrationPlanV2 for lesson '${lessonPlan.title}' with ${storyboard.scenes.length} scenes.`,
-        validator: (data) => NarrationPlanV2Schema.parse(data)
+        systemPrompt: `You are an expert voiceover writer for LuminaLearn STEM lessons. Language: ${language}. Use only the independently verified claims and exact source references supplied. Preserve scene IDs exactly; do not invent citations or mathematical claims.`,
+        userPrompt: `Generate NarrationPlanV2. Verified lesson plan: ${JSON.stringify(lessonPlan)}\nVerified claims: ${JSON.stringify(verifiedClaims)}\nExact source references: ${JSON.stringify(lessonPlan.sourceEvidence)}\nStoryboard scenes and goals: ${JSON.stringify(sceneContext)}`,
+        jsonSchema: narrationPlanV2JsonSchema,
+        validator: (data) => NarrationPlanV2Schema.parse(data),
+        requestBudget
       });
+      options.onProviderCall?.({
+        purpose: 'narration_planning',
+        mode: result.mode,
+        model: result.model,
+        ...(result.attempts !== undefined ? { attempt: result.attempts } : {}),
+        promptTokens: result.usage?.promptTokens,
+        candidatesTokens: result.usage?.candidatesTokens
+      });
+      const expectedScenes = new Set(storyboard.scenes.map((scene) => scene.sceneId));
+      const receivedScenes = new Set(result.data.segments.map((segment) => segment.sceneId));
+      if (receivedScenes.size !== expectedScenes.size || [...receivedScenes].some((id) => !expectedScenes.has(id))) {
+        throw new Error('narration_scene_mismatch: provider invented or omitted storyboard scene IDs');
+      }
+      const verifiedIds = new Set(verifiedClaims.map((claim) => claim.id));
+      const reviewedIds = new Set(result.data.mathematicalReview.verifiedClaimIds);
+      if (result.data.mathematicalReview.status !== 'verified' || reviewedIds.size !== verifiedIds.size ||
+          [...reviewedIds].some((id) => !verifiedIds.has(id))) {
+        throw new Error('narration_claim_mismatch: narration must reference the complete independently verified claim set and no others');
+      }
+      const mathConsistency = verifyNarrationAndStoryboardMathConsistency({
+        claims: lessonPlan.mathematicalClaims,
+        narrationPlan: result.data,
+        storyboard
+      });
+      if (!mathConsistency.valid) {
+        throw new Error(mathConsistency.conflicts.join('; '));
+      }
       return result.data;
     }
 
