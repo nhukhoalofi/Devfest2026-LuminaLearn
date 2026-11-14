@@ -7,22 +7,24 @@ import {
   LossLandscapeScene,
   AttentionHeatmapScene,
   SummaryScene,
-  GenericPlotScene
+  GenericPlotScene,
+  AlgebraIdentityScene
 } from '@luminalearn/animation';
 
 export interface LuminaSceneV3Props {
   storyboard: EducationalStoryboardV3;
+  subtitlesEnabled?: boolean;
   [key: string]: unknown;
 }
 
 /**
  * SceneDispatcherV3: Dispatch từng phân cảnh theo sceneType với contract visualPayload nghiêm ngặt.
  */
-const SceneDispatcher: React.FC<{ scene: EducationalSceneV3 }> = ({ scene }) => {
-  const subtitle = scene.narration.subtitleVietnamese || scene.narration.vietnamese;
-  const payload = scene.visualPayload as any;
+const SceneDispatcher: React.FC<{ scene: EducationalSceneV3; subtitlesEnabled: boolean }> = ({ scene, subtitlesEnabled }) => {
+  const subtitle = subtitlesEnabled ? (scene.narration.subtitleVietnamese || scene.narration.vietnamese) : undefined;
+  const payload = scene.visualPayload;
 
-  switch (scene.sceneType) {
+  switch (payload.sceneType) {
     case 'concept_intro':
       return <ConceptIntroScene title={scene.title} payload={payload} subtitleText={subtitle} />;
     case 'neural_architecture':
@@ -31,14 +33,19 @@ const SceneDispatcher: React.FC<{ scene: EducationalSceneV3 }> = ({ scene }) => 
       return <LossLandscapeScene title={scene.title} payload={payload} subtitleText={subtitle} />;
     case 'attention_heatmap':
       return <AttentionHeatmapScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+    case 'algebra_identity':
+      return <AlgebraIdentityScene title={scene.title} payload={payload} subtitleText={subtitle} />;
     case 'summary':
       return <SummaryScene title={scene.title} payload={payload} subtitleText={subtitle} />;
     case 'formula_derivation':
     case 'graph_plot':
     case 'flowchart_simulation':
     case 'comparison_table':
-    default:
       return <GenericPlotScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+    default: {
+      const unsupported: never = payload;
+      throw new Error(`unsupported_v3_scene_payload: ${String(unsupported)}`);
+    }
   }
 };
 
@@ -51,18 +58,17 @@ const SceneDispatcher: React.FC<{ scene: EducationalSceneV3 }> = ({ scene }) => 
  * - Lớp phủ phụ đề tiếng Việt an toàn (Burned-in subtitle safe area).
  * - Hoạt động độc lập không phụ thuộc Manim cho các phân cảnh đồ họa Remotion.
  */
-export const LuminaSceneV3: React.FC<LuminaSceneV3Props> = ({ storyboard }) => {
+export const LuminaSceneV3: React.FC<LuminaSceneV3Props> = ({ storyboard, subtitlesEnabled = true }) => {
   const { fps } = useVideoConfig();
-
-  let accumulatedFrames = 0;
 
   return (
     <AbsoluteFill style={{ backgroundColor: '#070B14' }}>
       {/* 1. Sequence từng scene dọc theo timeline */}
       {storyboard.scenes.map((scene, idx) => {
-        const sceneDurationFrames = Math.max(1, Math.round(scene.durationSeconds * fps));
-        const fromFrame = accumulatedFrames;
-        accumulatedFrames += sceneDurationFrames;
+        const startSeconds = storyboard.scenes.slice(0, idx).reduce((sum, item) => sum + item.durationSeconds, 0);
+        const endSeconds = startSeconds + scene.durationSeconds;
+        const fromFrame = Math.round(startSeconds * fps);
+        const sceneDurationFrames = Math.max(1, Math.round(endSeconds * fps) - fromFrame);
 
         return (
           <Sequence
@@ -71,7 +77,7 @@ export const LuminaSceneV3: React.FC<LuminaSceneV3Props> = ({ storyboard }) => {
             durationInFrames={sceneDurationFrames}
             name={`${idx + 1}. ${scene.title}`}
           >
-            <SceneDispatcher scene={scene} />
+            <SceneDispatcher scene={scene} subtitlesEnabled={subtitlesEnabled} />
           </Sequence>
         );
       })}

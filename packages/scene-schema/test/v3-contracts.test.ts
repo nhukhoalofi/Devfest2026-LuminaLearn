@@ -11,21 +11,23 @@ import {
 } from '../src/v3/index';
 
 describe('V3 Educational Contracts & Capability Registry', () => {
-  it('registers 10 benchmark topics across Mathematics and AI with honest renderReadiness', () => {
+  it('registers the benchmark topics plus Phase 4 algebra with honest renderReadiness', () => {
     const keys = Object.keys(REGISTERED_TOPICS_V3);
-    assert.equal(keys.length, 10);
+    assert.equal(keys.length, 11);
 
     const mathTopics = Object.values(REGISTERED_TOPICS_V3).filter((t) => t.domain === 'mathematics');
     const aiTopics = Object.values(REGISTERED_TOPICS_V3).filter((t) => t.domain === 'artificial_intelligence');
 
-    assert.equal(mathTopics.length, 5);
+    assert.equal(mathTopics.length, 6);
     assert.equal(aiTopics.length, 5);
 
     // Only topics with real renderers are marked render_ready
     assert.equal(REGISTERED_TOPICS_V3['calculus.derivative.intuition'].renderReadiness, 'render_ready');
     assert.equal(REGISTERED_TOPICS_V3['calculus.riemann_integral.intuition'].renderReadiness, 'render_ready');
-    assert.equal(REGISTERED_TOPICS_V3['ai.transformer.attention'].renderReadiness, 'planning_only');
-    assert.equal(REGISTERED_TOPICS_V3['ai.perceptron.activation'].renderReadiness, 'planning_only');
+    assert.equal(REGISTERED_TOPICS_V3['ai.transformer.attention'].renderReadiness, 'render_ready');
+    assert.equal(REGISTERED_TOPICS_V3['ai.gradient_descent.optimization'].renderReadiness, 'render_ready');
+    assert.equal(REGISTERED_TOPICS_V3['ai.perceptron.activation'].renderReadiness, 'render_ready');
+    assert.equal(REGISTERED_TOPICS_V3['algebra.identities.seven'].renderReadiness, 'render_ready');
   });
 
   it('deterministic classifier routes math and AI topics appropriately', () => {
@@ -131,6 +133,7 @@ describe('V3 Educational Contracts & Capability Registry', () => {
   it('validates a complete AI Lesson Plan V3 without requiring polynomial math equations', () => {
     const aiLessonPlan = {
       schemaVersion: 'lesson-v3',
+      generationProvenance: 'deterministic_mock',
       lessonId: 'lesson_ai_transformer_1',
       domain: 'artificial_intelligence',
       topicId: 'ai.transformer.attention',
@@ -300,6 +303,12 @@ describe('V3 Educational Contracts & Capability Registry', () => {
         ]
       };
       assert.equal(EducationalVisualPayloadSchema.safeParse(nonSquare).success, false);
+
+      const formerlyAcceptedLooseRow = {
+        sceneType: 'attention_heatmap', tokens: ['A', 'B'],
+        matrix: [[0.55, 0.55], [0.5, 0.5]], highlightTokenIndex: 2
+      };
+      assert.equal(EducationalVisualPayloadSchema.safeParse(formerlyAcceptedLooseRow).success, false);
     });
 
     it('validates a mathematically bounded LossLandscapeVisualPayload', () => {
@@ -307,7 +316,7 @@ describe('V3 Educational Contracts & Capability Registry', () => {
         sceneType: 'loss_landscape' as const,
         functionType: 'convex_quadratic' as const,
         minimumPoint: { w: 1.5, loss: 0.0 },
-        curvature: 2.0,
+        curvature: 1.0,
         currentParam: 3.5,
         learningRate: 0.1,
         steps: [
@@ -324,6 +333,19 @@ describe('V3 Educational Contracts & Capability Registry', () => {
         curvature: -1.0
       };
       assert.equal(EducationalVisualPayloadSchema.safeParse(invalidLoss).success, false);
+
+      const fabricatedStep = { ...validLoss, steps: [{ stepNumber: 1, w: 3.5, loss: 999, gradient: 4 }] };
+      assert.equal(EducationalVisualPayloadSchema.safeParse(fabricatedStep).success, false);
+    });
+
+    it('rejects impossible nodes, reverse edges, duplicate layer IDs, and input dimension mismatch', () => {
+      const invalid = {
+        sceneType: 'neural_architecture', networkType: 'perceptron',
+        layers: [{ layerId: 'same', name: 'In', nodeCount: 1 }, { layerId: 'same', name: 'Out', nodeCount: 1 }],
+        weights: [{ fromLayer: 1, fromNode: 4, toLayer: 0, toNode: 0, weightValue: 1 }],
+        inputValues: [1, 2], signalMode: 'signal_flow_illustration'
+      };
+      assert.equal(EducationalVisualPayloadSchema.safeParse(invalid).success, false);
     });
   });
 });

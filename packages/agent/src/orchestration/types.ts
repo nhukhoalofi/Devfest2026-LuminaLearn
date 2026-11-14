@@ -37,12 +37,13 @@ export interface OrchestrationLogEntry {
 export interface TopicClassification {
   topicId: string;
   displayName: string;
-  domain: 'calculus' | 'linear_algebra' | 'trigonometry' | 'statistics' | 'general';
+  domain: 'calculus' | 'linear_algebra' | 'trigonometry' | 'statistics' | 'algebra' | 'general';
   confidence: number;
   supportedTemplates: string[];
   requiredValidators: string[];
   isSupported: boolean;
   unsupportedReason?: string;
+  v3Only?: boolean;
 }
 
 export interface DocumentAnalysisResult {

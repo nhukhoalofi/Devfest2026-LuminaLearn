@@ -8,6 +8,8 @@ import {
 import { EducationalVisualPayloadSchema, type EducationalVisualPayload } from './visual-dsl';
 
 export const LESSON_SCHEMA_VERSION_V3 = 'lesson-v3' as const;
+export const GenerationProvenanceV3Schema = z.enum(['deterministic_mock', 'ai_generated_live']);
+export type GenerationProvenanceV3 = z.infer<typeof GenerationProvenanceV3Schema>;
 
 export const EducationalClaimTypeSchema = z.enum([
   'formal_mathematics',
@@ -27,6 +29,13 @@ export const EducationalVerificationStatusSchema = z.enum([
 ]);
 export type EducationalVerificationStatus = z.infer<typeof EducationalVerificationStatusSchema>;
 
+export const StatementSemanticStatusSchema = z.enum([
+  'formal_match',
+  'human_review_required',
+  'contradiction_detected'
+]);
+export type StatementSemanticStatus = z.infer<typeof StatementSemanticStatusSchema>;
+
 /**
  * Mệnh đề tri thức giáo dục V3 (EducationalClaimV3)
  * Phân biệt rành mạch giữa chứng minh hình thức toán học và khái niệm AI định tính.
@@ -40,7 +49,10 @@ export const EducationalClaimV3Schema = z.object({
   verificationStatus: EducationalVerificationStatusSchema,
   formalProofSummary: z.string().trim().max(500).optional(),
   sourceReferenceId: SafeIdString.optional(),
-  humanReviewComment: z.string().trim().max(500).optional()
+  humanReviewComment: z.string().trim().max(500).optional(),
+  formalExpressionVerified: z.boolean().optional(),
+  statementSemanticStatus: StatementSemanticStatusSchema.optional(),
+  statementContradictionReason: z.string().trim().max(500).optional()
 }).strict().superRefine((claim, ctx) => {
   // Quy tắc kiểm soát tính chân thực (Ground Truth Gate):
   // 1. Mệnh đề formal_mathematics nếu tuyên bố 'formally_verified' BẮT BUỘC phải có biểu thức formalExpression và tóm tắt kiểm định formalProofSummary
@@ -69,6 +81,24 @@ export const EducationalClaimV3Schema = z.object({
       message: 'Khái niệm AI định tính (ai_concept) không thể mang trạng thái formally_verified; hãy dùng source_grounded hoặc human_review_required'
     });
   }
+
+  // 3. Nếu statement mâu thuẫn với formalExpression, cấm formally_verified
+  if (claim.statementSemanticStatus === 'contradiction_detected' && claim.verificationStatus === 'formally_verified') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['verificationStatus'],
+      message: 'Mệnh đề có statement mâu thuẫn với biểu thức formalExpression không thể mang trạng thái formally_verified'
+    });
+  }
+
+  // 4. Nếu formal_mathematics formally_verified, formalExpressionVerified không được là false
+  if (claim.claimType === 'formal_mathematics' && claim.verificationStatus === 'formally_verified' && claim.formalExpressionVerified === false) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['formalExpressionVerified'],
+      message: 'Mệnh đề toán học formally_verified bắt buộc phải có biểu thức formalExpression đã được SymPy chứng minh'
+    });
+  }
 });
 
 export type EducationalClaimV3 = z.infer<typeof EducationalClaimV3Schema>;
@@ -80,6 +110,7 @@ export const EducationalSceneTypeSchema = z.enum([
   'neural_architecture',
   'loss_landscape',
   'attention_heatmap',
+  'algebra_identity',
   'flowchart_simulation',
   'comparison_table',
   'summary'
@@ -104,17 +135,11 @@ export const EducationalSceneV3Schema = z.object({
   visualPayload: EducationalVisualPayloadSchema
 }).strict().superRefine((scene, ctx) => {
   if (scene.visualPayload.sceneType !== scene.sceneType) {
-    // Cho phép fallback generic payload cho các sceneType như formula_derivation, graph_plot
-    const isGenericMatch =
-      ['formula_derivation', 'graph_plot', 'flowchart_simulation', 'comparison_table'].includes(scene.sceneType) &&
-      ['formula_derivation', 'graph_plot', 'flowchart_simulation', 'comparison_table'].includes(scene.visualPayload.sceneType);
-    if (!isGenericMatch) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['visualPayload', 'sceneType'],
-        message: `visualPayload.sceneType (${scene.visualPayload.sceneType}) không khớp với scene.sceneType (${scene.sceneType})`
-      });
-    }
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['visualPayload', 'sceneType'],
+      message: `visualPayload.sceneType (${scene.visualPayload.sceneType}) không khớp với scene.sceneType (${scene.sceneType})`
+    });
   }
 });
 
@@ -155,7 +180,14 @@ export const KnowledgeValidationReportV3Schema = z.object({
       claimType: EducationalClaimTypeSchema,
       status: EducationalVerificationStatusSchema,
       evidenceSource: z.string().optional(),
-      verifierNotes: z.string().optional()
+      verifierNotes: z.string().optional(),
+      verifierImplementation: z.string().trim().min(1).max(120).optional(),
+      verificationBinding: z.object({
+        claimId: SafeIdString,
+        exactExpression: z.string().trim().min(1).max(300),
+        mathSpecCanonical: z.string().trim().min(2).max(2000),
+        assumptions: z.array(z.string().trim().min(1).max(300)).max(12)
+      }).strict().optional()
     }).strict()
   ),
   requiresHumanPedagogicalSignoff: z.boolean(),
@@ -169,6 +201,7 @@ export type KnowledgeValidationReportV3 = z.infer<typeof KnowledgeValidationRepo
  */
 export const EducationalLessonPlanV3Schema = z.object({
   schemaVersion: z.literal(LESSON_SCHEMA_VERSION_V3),
+  generationProvenance: GenerationProvenanceV3Schema,
   lessonId: SafeIdString,
   domain: EducationalDomainSchema,
   topicId: z.string().regex(/^[a-z0-9_.-]{3,80}$/),
@@ -195,6 +228,23 @@ export const EducationalLessonPlanV3Schema = z.object({
       });
     }
     seenIds.add(claim.id);
+  }
+  const claimIds = new Set(plan.educationalClaims.map((claim) => claim.id));
+  plan.storyboard?.scenes.forEach((scene, sceneIndex) => scene.boundClaimIds.forEach((claimId, claimIndex) => {
+    if (!claimIds.has(claimId)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['storyboard', 'scenes', sceneIndex, 'boundClaimIds', claimIndex], message: `Scene tham chiếu claim không tồn tại: ${claimId}` });
+  }));
+  plan.sourceEvidence.forEach((evidence, index) => {
+    if (!claimIds.has(evidence.claimId)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['sourceEvidence', index, 'claimId'], message: `Evidence tham chiếu claim không tồn tại: ${evidence.claimId}` });
+  });
+  if (plan.storyboard?.lessonId !== undefined && plan.storyboard.lessonId !== plan.lessonId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['storyboard', 'lessonId'], message: 'Storyboard lessonId không khớp lesson plan' });
+  }
+  if (plan.validationReport) {
+    if (plan.validationReport.lessonId !== plan.lessonId) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['validationReport', 'lessonId'], message: 'Validation report không khớp lessonId' });
+    const reportIds = plan.validationReport.claimReports.map((report) => report.claimId);
+    if (new Set(reportIds).size !== reportIds.length || reportIds.length !== claimIds.size || reportIds.some((id) => !claimIds.has(id))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['validationReport', 'claimReports'], message: 'Validation report phải ánh xạ chính xác một lần cho mọi claim' });
+    }
   }
 });
 

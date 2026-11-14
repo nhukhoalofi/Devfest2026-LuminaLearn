@@ -5,12 +5,15 @@ import {
   type EducationalStoryboardV3,
   EducationalLessonPlanV3Schema,
   GeminiRequestBudget,
+  type MathVisualizationSpecV2,
   REGISTERED_TOPICS_V3,
-  type TopicCapabilityReportV3
+  type TopicCapabilityReportV3,
+  verifyExternalApiConsentV3,
+  type ExternalApiConsentRecordV3
 } from '@luminalearn/scene-schema';
 import type { AIProvider } from './ai-provider';
 import type { DocumentAnalysisResult } from './types';
-import { KnowledgeValidationServiceV3 } from './knowledge-validation-v3';
+import { KnowledgeValidationServiceV3, validateAlgebraSceneMath } from './knowledge-validation-v3';
 
 export interface EducationalPlannerV3Options {
   aiProvider?: AIProvider;
@@ -25,6 +28,25 @@ export interface PlanLessonV3Input {
   language?: 'vi' | 'en';
   targetDurationSeconds?: number;
   documentAnalysis?: DocumentAnalysisResult;
+  ownerId?: string;
+  externalApiConsent?: boolean;
+  consentRecord?: ExternalApiConsentRecordV3;
+  mathSpec?: MathVisualizationSpecV2;
+  assumptions?: string[];
+}
+
+export class EducationalGenerationError extends Error {
+  public readonly provenance = 'generation_failed' as const;
+  public readonly code: string;
+
+  constructor(error: unknown) {
+    const source = error instanceof Error ? error : new Error(String(error));
+    super(source.message, { cause: source });
+    this.name = 'EducationalGenerationError';
+    this.code = typeof (source as Error & { code?: unknown }).code === 'string'
+      ? String((source as Error & { code?: string }).code)
+      : 'live_generation_failed';
+  }
 }
 
 /**
@@ -65,17 +87,17 @@ export class EducationalPlannerV3 {
     let candidatePlan: EducationalLessonPlanV3;
 
     if (this.aiProvider && !this.aiProvider.isMock) {
+      if (input.externalApiConsent !== true) {
+        throw new EducationalGenerationError(
+          Object.assign(new Error('Explicit external API consent is required for live Gemini planning.'), {
+            code: 'external_api_consent_required'
+          })
+        );
+      }
       try {
         candidatePlan = await this.planLessonWithAI(input, capabilityReport);
-      } catch (_err) {
-        // Fallback an toàn về deterministic plan nếu AI thất bại
-        candidatePlan = this.buildDeterministicPlan(
-          lessonId,
-          topic,
-          capabilityReport,
-          targetDurationSeconds,
-          documentAnalysis
-        );
+      } catch (error) {
+        throw error instanceof EducationalGenerationError ? error : new EducationalGenerationError(error);
       }
     } else {
       candidatePlan = this.buildDeterministicPlan(
@@ -94,11 +116,28 @@ export class EducationalPlannerV3 {
       topicId: capabilityReport.topicId,
       domain: capabilityReport.domain,
       claims: candidatePlan.educationalClaims,
-      sourceEvidence: documentAnalysis?.evidence || candidatePlan.sourceEvidence
+      sourceEvidence: documentAnalysis?.evidence || candidatePlan.sourceEvidence,
+      mathSpec: input.mathSpec,
+      assumptions: input.assumptions
     });
 
     candidatePlan.educationalClaims = validationResult.validatedClaims;
     candidatePlan.validationReport = validationResult.report;
+
+    // CHECKPOINT C: Kiểm định tính toàn vẹn toán học của từng phân cảnh đại số
+    if (candidatePlan.storyboard) {
+      for (const scene of candidatePlan.storyboard.scenes) {
+        if (scene.sceneType === 'algebra_identity') {
+          const sceneCheck = await validateAlgebraSceneMath({
+            scene,
+            verifiedClaims: candidatePlan.educationalClaims
+          });
+          if (!sceneCheck.valid) {
+            throw new EducationalGenerationError(sceneCheck.reason || 'algebra_scene_math_invalid');
+          }
+        }
+      }
+    }
 
     // Bước 4: Xác thực qua Zod Schema V3 chặt chẽ
     return EducationalLessonPlanV3Schema.parse(candidatePlan);
@@ -114,6 +153,22 @@ export class EducationalPlannerV3 {
   ): Promise<EducationalLessonPlanV3> {
     if (!this.aiProvider) {
       throw new Error('ai_provider_missing: No AI provider configured for live planning.');
+    }
+
+    if (!this.aiProvider.isMock) {
+      if (!input.consentRecord) {
+        throw new Error('external_api_consent_required: Live Gemini planning requires a valid signed consentRecord');
+      }
+      const check = verifyExternalApiConsentV3({
+        consent: input.consentRecord,
+        ownerId: input.ownerId ?? 'local-single-user',
+        expectedProvider: 'gemini',
+        expectedOperation: 'planning',
+        isLiveOperation: true
+      });
+      if (!check.valid) {
+        throw new Error(`external_api_consent_rejected: ${check.reason || 'Live Gemini planning requires valid planning consent'}`);
+      }
     }
 
     const budget = this.requestBudget ?? new GeminiRequestBudget();
@@ -158,6 +213,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
 
         return {
           schemaVersion: 'lesson-v3',
+          generationProvenance: 'ai_generated_live',
           lessonId: input.lessonId,
           domain: capability.domain,
           topicId: capability.topicId,
@@ -206,7 +262,93 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
     let scenes: EducationalStoryboardV3['scenes'] = [];
 
     // --- MATHEMATICS BENCHMARKS ---
-    if (capability.topicId === 'calculus.derivative.intuition') {
+    if (capability.topicId === 'algebra.identities.seven') {
+      const identities = [
+        ['square_sum', '(a+b)^2', 'a^2+2*a*b+b^2', 'Bình phương của một tổng'],
+        ['square_difference', '(a-b)^2', 'a^2-2*a*b+b^2', 'Bình phương của một hiệu'],
+        ['difference_squares', 'a^2-b^2', '(a-b)*(a+b)', 'Hiệu hai bình phương'],
+        ['cube_sum_expansion', '(a+b)^3', 'a^3+3*a^2*b+3*a*b^2+b^3', 'Lập phương của một tổng'],
+        ['cube_difference_expansion', '(a-b)^3', 'a^3-3*a^2*b+3*a*b^2-b^3', 'Lập phương của một hiệu'],
+        ['sum_cubes', 'a^3+b^3', '(a+b)*(a^2-a*b+b^2)', 'Tổng hai lập phương'],
+        ['difference_cubes', 'a^3-b^3', '(a-b)*(a^2+a*b+b^2)', 'Hiệu hai lập phương']
+      ] as const;
+      summary = 'Bảy hằng đẳng thức được kiểm chứng bằng biến đổi đại số, giúp khai triển và phân tích đa thức thành nhân tử.';
+      learningObjectives = ['Nhận dạng đúng bảy hằng đẳng thức', 'Hiểu các bước khai triển hoặc phân tích nhân tử thay vì chỉ ghi nhớ công thức'];
+      keyConcepts = ['Khai triển', 'Phân tích nhân tử', 'Hạng tử tương đương', 'Bình phương', 'Lập phương'];
+      claims = identities.map(([id, left, right, label], index) => ({
+        id: `claim_identity_${index + 1}`,
+        claimType: 'formal_mathematics' as const,
+        statement: `${label}: ${left} = ${right}`,
+        formalExpression: `${left}=${right}`,
+        validatorKey: `algebra_identity_${index + 1}`,
+        verificationStatus: 'unverified' as const
+      }));
+      const identitySteps: Record<string, Array<{ expression: string; explanationVietnamese: string; highlightTerms: string[] }>> = {
+        square_sum: [
+          { expression: '(a+b)^2', explanationVietnamese: 'Bình phương của một tổng ban đầu.', highlightTerms: ['(a+b)^2'] },
+          { expression: '(a+b)*(a+b)', explanationVietnamese: 'Viết dưới dạng tích của hai nhị thức bậc nhất.', highlightTerms: ['(a+b)'] },
+          { expression: 'a^2+a*b+b*a+b^2', explanationVietnamese: 'Áp dụng tính chất phân phối nhân đa thức với đa thức.', highlightTerms: ['a*b', 'b*a'] },
+          { expression: 'a^2+2*a*b+b^2', explanationVietnamese: 'Gom hai hạng tử đồng dạng a*b + b*a = 2ab.', highlightTerms: ['2*a*b'] }
+        ],
+        square_difference: [
+          { expression: '(a-b)^2', explanationVietnamese: 'Bình phương của một hiệu ban đầu.', highlightTerms: ['(a-b)^2'] },
+          { expression: '(a-b)*(a-b)', explanationVietnamese: 'Viết dưới dạng tích hai nhị thức.', highlightTerms: ['(a-b)'] },
+          { expression: 'a^2-a*b-b*a+b^2', explanationVietnamese: 'Khai triển nhân từng hạng tử và chú ý dấu âm.', highlightTerms: ['-a*b', '-b*a'] },
+          { expression: 'a^2-2*a*b+b^2', explanationVietnamese: 'Gom hai hạng tử đồng dạng âm thành -2ab.', highlightTerms: ['-2*a*b'] }
+        ],
+        difference_squares: [
+          { expression: 'a^2-b^2', explanationVietnamese: 'Hiệu của hai bình phương ban đầu.', highlightTerms: ['a^2-b^2'] },
+          { expression: 'a^2+a*b-a*b-b^2', explanationVietnamese: 'Thêm bớt hạng tử trung gian a*b - a*b = 0.', highlightTerms: ['+a*b', '-a*b'] },
+          { expression: '(a-b)*(a+b)', explanationVietnamese: 'Nhóm hạng tử để phân tích thành tích hai nhân tử.', highlightTerms: ['(a-b)', '(a+b)'] }
+        ],
+        cube_sum_expansion: [
+          { expression: '(a+b)^3', explanationVietnamese: 'Lập phương của một tổng ban đầu.', highlightTerms: ['(a+b)^3'] },
+          { expression: '(a+b)*(a+b)^2', explanationVietnamese: 'Tách thành tích của nhị thức bậc nhất và bình phương.', highlightTerms: ['(a+b)^2'] },
+          { expression: '(a+b)*(a^2+2*a*b+b^2)', explanationVietnamese: 'Thay bình phương một tổng đã biết vào.', highlightTerms: ['a^2+2*a*b+b^2'] },
+          { expression: 'a^3+3*a^2*b+3*a*b^2+b^3', explanationVietnamese: 'Khai triển toàn bộ và thu gọn các hạng tử đồng dạng.', highlightTerms: ['3*a^2*b', '3*a*b^2'] }
+        ],
+        cube_difference_expansion: [
+          { expression: '(a-b)^3', explanationVietnamese: 'Lập phương của một hiệu ban đầu.', highlightTerms: ['(a-b)^3'] },
+          { expression: '(a-b)*(a-b)^2', explanationVietnamese: 'Tách tích nhị thức bậc nhất và bình phương một hiệu.', highlightTerms: ['(a-b)^2'] },
+          { expression: '(a-b)*(a^2-2*a*b+b^2)', explanationVietnamese: 'Khai triển bình phương một hiệu.', highlightTerms: ['a^2-2*a*b+b^2'] },
+          { expression: 'a^3-3*a^2*b+3*a*b^2-b^3', explanationVietnamese: 'Khai triển nhân và thu gọn các hạng tử đồng dạng.', highlightTerms: ['-3*a^2*b', '+3*a*b^2'] }
+        ],
+        sum_cubes: [
+          { expression: 'a^3+b^3', explanationVietnamese: 'Tổng hai lập phương ban đầu.', highlightTerms: ['a^3+b^3'] },
+          { expression: '(a+b)*(a^2-a*b+b^2)', explanationVietnamese: 'Phân tích thành tích của tổng và bình phương thiếu của hiệu.', highlightTerms: ['(a+b)', '(a^2-a*b+b^2)'] }
+        ],
+        difference_cubes: [
+          { expression: 'a^3-b^3', explanationVietnamese: 'Hiệu hai lập phương ban đầu.', highlightTerms: ['a^3-b^3'] },
+          { expression: '(a-b)*(a^2+a*b+b^2)', explanationVietnamese: 'Phân tích thành tích của hiệu và bình phương thiếu của tổng.', highlightTerms: ['(a-b)', '(a^2+a*b+b^2)'] }
+        ]
+      };
+
+      const baseDuration = Math.max(5, Math.floor(targetDurationSeconds / identities.length));
+      scenes = identities.map(([id, left, right, label], index) => ({
+        sceneId: `sc_identity_${index + 1}`,
+        sceneType: 'algebra_identity' as const,
+        title: `${index + 1}. ${label}`,
+        pedagogicalGoal: index < 5 ? 'Khai triển theo quy tắc phân phối và gom các hạng tử đồng dạng' : 'Phân tích biểu thức thành tích của hai nhân tử',
+        durationSeconds: baseDuration,
+        boundClaimIds: [`claim_identity_${index + 1}`],
+        rendererTarget: 'remotion_infographic' as const,
+        narration: {
+          vietnamese: `${label}. Ta biến đổi từng bước và đối chiếu hai vế để thấy chúng hoàn toàn tương đương.`,
+          subtitleVietnamese: `${left} bằng ${right}.`
+        },
+        visualPayload: {
+          sceneType: 'algebra_identity' as const,
+          identityId: id,
+          leftExpression: left,
+          rightExpression: right,
+          transformationSteps: identitySteps[id] ?? [
+            { expression: left, explanationVietnamese: 'Giữ nguyên biểu thức ban đầu.', highlightTerms: [left] },
+            { expression: right, explanationVietnamese: 'Khai triển hoặc phân tích nhân tử.', highlightTerms: [right] }
+          ],
+          presentation: (index < 5 ? 'expansion' : 'factorization') as 'expansion' | 'factorization'
+        }
+      }));
+    } else if (capability.topicId === 'calculus.derivative.intuition') {
       summary = 'Bản chất hình học của đạo hàm là hệ số góc của tiếp tuyến khi cát tuyến co lại.';
       learningObjectives = [
         'Hiểu bản chất tiếp tuyến là giới hạn của cát tuyến',
@@ -396,7 +538,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
       claims = [
         {
           id: 'claim_lin_basis',
-          claimType: 'formal_mathematics',
+          claimType: 'algorithmic_property',
           statement: 'Phép biến đổi tuyến tính được xác định hoàn toàn bởi tọa độ ảnh của các vector cơ sở.',
           formalExpression: 'T(v) = A * v',
           validatorKey: 'matrix_transform',
@@ -450,7 +592,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
       claims = [
         {
           id: 'claim_bayes_formula',
-          claimType: 'formal_mathematics',
+          claimType: 'algorithmic_property',
           statement: 'Xác suất hậu nghiệm P(A|B) bằng P(B|A) nhân P(A) chia cho P(B).',
           formalExpression: 'P(A|B) = P(B|A) * P(A) / P(B)',
           validatorKey: 'bayes_theorem',
@@ -531,7 +673,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           sceneType: 'neural_architecture',
           title: 'Cấu tạo một Nơ-ron nhân tạo',
           pedagogicalGoal: 'Trực quan hóa luồng dữ liệu từ các đầu vào x_i, nhân trọng số w_i đến bộ tích lũy',
-          durationSeconds: 20,
+          durationSeconds: 17,
           boundClaimIds: ['claim_perceptron_structure'],
           rendererTarget: 'remotion_infographic',
           narration: {
@@ -550,6 +692,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
               { fromLayer: 0, fromNode: 1, toLayer: 1, toNode: 0, weightValue: -0.5 }
             ],
             inputValues: [1.0, 0.5],
+            signalMode: 'signal_flow_illustration',
             highlightActiveSignal: true,
             outputLabels: ['Dự đoán (y)']
           }
@@ -559,7 +702,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           sceneType: 'graph_plot',
           title: 'Sức mạnh của tính phi tuyến',
           pedagogicalGoal: 'So sánh đường cong kích hoạt Sigmoid và ReLU giúp mạng học được các mặt phân chia phức tạp',
-          durationSeconds: 20,
+          durationSeconds: 18,
           boundClaimIds: ['claim_non_linearity'],
           rendererTarget: 'remotion_infographic',
           narration: {
@@ -569,7 +712,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
           visualPayload: {
             sceneType: 'graph_plot',
             headline: 'Hàm kích hoạt phi tuyến',
-            formulaTex: '\\sigma(z) = \\frac{1}{1 + e^{-z}}, \\quad \\text{ReLU}(z) = \\max(0, z)',
+            formulaTex: 'σ(z) = 1 / (1 + e^(-z)); ReLU(z) = max(0, z)',
             notes: 'Phi tuyến tính phá vỡ giới hạn biến đổi affine'
           }
         }
@@ -730,7 +873,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
       claims = [
         {
           id: 'claim_chain_rule_bp',
-          claimType: 'formal_mathematics',
+          claimType: 'algorithmic_property',
           statement: 'Theo quy tắc chuỗi vi phân: dL/dw = (dL/dy) * (dy/dz) * (dz/dw)',
           formalExpression: 'dL/dw = (dL/dy) * (dy/dz) * (dz/dw)',
           validatorKey: 'chain_rule_formula',
@@ -919,6 +1062,7 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
 
     return {
       schemaVersion: 'lesson-v3',
+      generationProvenance: 'deterministic_mock',
       lessonId,
       domain: capability.domain,
       topicId: capability.topicId,
@@ -941,12 +1085,13 @@ Thời lượng mục tiêu: ${input.targetDurationSeconds ?? 40} giây.`;
 
   private getDefaultClaimsForTopic(capability: TopicCapabilityReportV3): EducationalClaimV3[] {
     const isMath = capability.domain === 'mathematics';
+    const isAlgebra = capability.topicId === 'algebra.identities.seven';
     return [
       {
         id: 'claim_default_1',
         claimType: isMath ? 'formal_mathematics' : 'ai_concept',
         statement: `Khái niệm cơ bản của ${capability.displayName}`,
-        formalExpression: isMath ? 'f(x) = x' : undefined,
+        formalExpression: isAlgebra ? '(a+b)^2 = a^2+2*a*b+b^2' : isMath ? 'x^2 = x^2' : undefined,
         verificationStatus: 'unverified',
         humanReviewComment: 'Mệnh đề mặc định cần giáo viên xem xét sư phạm.'
       }

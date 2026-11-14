@@ -24,7 +24,7 @@ const LuminaVideoSchema = z.object({
 
 const LuminaMathHybridSchema = z.object({ manifest: HybridVideoManifestSchema });
 const LuminaDynamicV2Schema = z.object({ manifest: RenderManifestV2Schema });
-const LuminaSceneV3Schema = z.object({ storyboard: EducationalStoryboardV3Schema });
+const LuminaSceneV3Schema = z.object({ storyboard: EducationalStoryboardV3Schema, subtitlesEnabled: z.boolean().default(true) });
 
 export const Root: React.FC = () => {
   return (
@@ -62,6 +62,19 @@ export const Root: React.FC = () => {
         defaultProps={{ manifest: dynamicV2DefaultManifest }}
       />
       <Composition<typeof LuminaSceneV3Schema, LuminaSceneV3Props>
+        id="LuminaSceneV3"
+        component={LuminaSceneV3}
+        durationInFrames={Math.round(perceptronStoryboardV3.totalDurationSeconds * 24)}
+        fps={24}
+        width={720}
+        height={1280}
+        schema={LuminaSceneV3Schema}
+        defaultProps={{ storyboard: perceptronStoryboardV3, subtitlesEnabled: true }}
+        calculateMetadata={({ props }) => ({
+          durationInFrames: Math.max(1, Math.round(props.storyboard.totalDurationSeconds * 24))
+        })}
+      />
+      <Composition<typeof LuminaSceneV3Schema, LuminaSceneV3Props>
         id="LuminaSceneV3Perceptron"
         component={LuminaSceneV3}
         durationInFrames={Math.round(perceptronStoryboardV3.totalDurationSeconds * 24)}
@@ -69,7 +82,7 @@ export const Root: React.FC = () => {
         width={720}
         height={1280}
         schema={LuminaSceneV3Schema}
-        defaultProps={{ storyboard: perceptronStoryboardV3 }}
+        defaultProps={{ storyboard: perceptronStoryboardV3, subtitlesEnabled: true }}
       />
       <Composition<typeof LuminaSceneV3Schema, LuminaSceneV3Props>
         id="LuminaSceneV3GradientDescent"
@@ -79,7 +92,7 @@ export const Root: React.FC = () => {
         width={720}
         height={1280}
         schema={LuminaSceneV3Schema}
-        defaultProps={{ storyboard: gradientDescentStoryboardV3 }}
+        defaultProps={{ storyboard: gradientDescentStoryboardV3, subtitlesEnabled: true }}
       />
       <Composition<typeof LuminaSceneV3Schema, LuminaSceneV3Props>
         id="LuminaSceneV3Attention"
@@ -89,7 +102,7 @@ export const Root: React.FC = () => {
         width={720}
         height={1280}
         schema={LuminaSceneV3Schema}
-        defaultProps={{ storyboard: attentionStoryboardV3 }}
+        defaultProps={{ storyboard: attentionStoryboardV3, subtitlesEnabled: true }}
       />
     </>
   );
