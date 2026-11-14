@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { GroundingEvidenceSchema, NoExecutableString, SafeIdString, SourceReferenceSchema } from './document';
+import { MathVisualizationSpecV2Schema } from './math-spec';
+import { VisualStyleIdSchema } from './visual-style';
 
 export const LESSON_SCHEMA_VERSION_V2 = 'lesson-v2' as const;
 export const MANIFEST_SCHEMA_VERSION_V2 = 'manifest-v2' as const;
@@ -8,7 +10,7 @@ export const SupportedLanguageSchema = z.enum(['vi', 'en']);
 export const SupportedAspectRatioSchema = z.enum(['9:16', '16:9', '1:1']);
 export type SupportedAspectRatio = z.infer<typeof SupportedAspectRatioSchema>;
 export const SupportedRenderModeSchema = z.enum(['mock', 'live']);
-export const SupportedNarrationModeSchema = z.enum(['none', 'provided_audio', 'google_cloud_tts']);
+export const SupportedNarrationModeSchema = z.enum(['none', 'provided_audio', 'google_cloud_tts', 'gemini_tts']);
 export const SupportedInputModeSchema = z.enum(['topic_prompt', 'source_document']);
 
 /**
@@ -25,6 +27,8 @@ export const LessonRequestV2Schema = z.object({
   renderMode: SupportedRenderModeSchema.default('mock'),
   narrationMode: SupportedNarrationModeSchema.default('none'),
   aspectRatio: SupportedAspectRatioSchema.default('9:16'),
+  visualStyleId: VisualStyleIdSchema.default('clean_educational_infographic'),
+  subtitlesEnabled: z.boolean().default(true),
   providedAudioPath: z.string().trim().min(1).max(1024).optional()
 }).strict().superRefine((req, ctx) => {
   if (req.inputMode === 'source_document' && req.sourceDocumentIds.length === 0) {
@@ -43,19 +47,33 @@ export const LessonRequestV2Schema = z.object({
   }
 });
 
-export type LessonRequestV2 = z.infer<typeof LessonRequestV2Schema>;
+type ParsedLessonRequestV2 = z.infer<typeof LessonRequestV2Schema>;
+/** Input-compatible type keeps the V2.3 request surface source-compatible; parsing supplies defaults. */
+export type LessonRequestV2 = Omit<ParsedLessonRequestV2, 'visualStyleId' | 'subtitlesEnabled'> & {
+  visualStyleId?: ParsedLessonRequestV2['visualStyleId'];
+  subtitlesEnabled?: ParsedLessonRequestV2['subtitlesEnabled'];
+};
 
 /**
  * Mệnh đề toán học đã/chưa kiểm định (VerifiedClaim)
  */
 export const MathVerificationStatusSchema = z.enum(['verified', 'unverified', 'failed']);
+export const StatementVerificationStatusSchema = z.enum([
+  'formal_match',
+  'prose_unverified',
+  'conflict_detected'
+]);
+export type StatementVerificationStatus = z.infer<typeof StatementVerificationStatusSchema>;
 
 export const VerifiedClaimSchema = z.object({
   id: SafeIdString,
   statement: NoExecutableString,
+  canonicalStatement: NoExecutableString.optional(),
   validatorKey: z.string().regex(/^[a-z0-9_]{3,64}$/),
   expectedExpression: z.string().regex(/^[0-9a-zA-Z\s+\-*^()./\\=><_{}\[\]]+$/, 'Mathematical expression contains forbidden characters'),
   verificationStatus: MathVerificationStatusSchema,
+  statementVerification: StatementVerificationStatusSchema.optional(),
+  humanSemanticReviewConfirmed: z.boolean().optional(),
   sourceReferenceId: SafeIdString.optional()
 }).strict();
 
@@ -86,6 +104,7 @@ export const LessonPlanV2Schema = z.object({
   prerequisites: z.array(NoExecutableString).max(6).default([]),
   keyConcepts: z.array(NoExecutableString).min(1).max(8),
   mathematicalClaims: z.array(VerifiedClaimSchema).min(1).max(12),
+  mathSpec: MathVisualizationSpecV2Schema.optional(),
   sourceEvidence: z.array(GroundingEvidenceSchema).default([]),
   pedagogicalSequence: z.array(PedagogicalStepSchema).min(1).max(10),
   summary: NoExecutableString
@@ -111,6 +130,7 @@ export const VisualSceneSpecV2Schema = z.object({
   sceneId: SafeIdString,
   templateId: z.string().regex(/^[a-z0-9_]{3,64}$/),
   sceneType: SceneTypeSchema,
+  visualStyleId: VisualStyleIdSchema.optional(),
   durationFrames: z.number().int().positive().max(7200), // Tối đa 5 phút ở 24fps
   parameters: z.record(z.string(), z.any()),
   layout: z.object({
@@ -202,6 +222,7 @@ export const TimelineSceneV2Schema = z.object({
   id: SafeIdString,
   sceneType: SceneTypeSchema,
   templateId: z.string().regex(/^[a-z0-9_]{3,64}$/),
+  visualStyleId: VisualStyleIdSchema.optional(),
   startFrame: z.number().int().nonnegative(),
   durationFrames: z.number().int().positive(),
   assetId: SafeIdString.optional(),

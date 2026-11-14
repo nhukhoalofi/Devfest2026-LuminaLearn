@@ -10,15 +10,20 @@ import {
   LocalJobRepository
 } from '@luminalearn/hybrid-renderer';
 import {
+  ApprovedRenderArtifactV2Schema,
   LessonRequestV2Schema,
+  type ApprovedRenderArtifactV2,
   type LessonRequestV2
 } from '@luminalearn/scene-schema';
+import { verifyArtifactIntegrity } from '@luminalearn/agent';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { documentStore } from './v2-services';
+import { assertOwnerMatch, getMaxPendingJobs, SecurityError } from './security';
 
 export interface JobRecord {
   jobId: string;
+  ownerId?: string;
   status: JobState;
   progress: number;
   message: string;
@@ -28,9 +33,11 @@ export interface JobRecord {
   error?: string;
   videoUrl?: string;
   outputPath?: string;
-  voiceoverMode: 'none' | 'provided_audio' | 'google_cloud_tts';
+  voiceoverMode: 'none' | 'provided_audio' | 'google_cloud_tts' | 'gemini_tts';
+  visualStyleId?: 'math_chalkboard' | 'clean_educational_infographic';
   subtitlesEnabled: boolean;
   failureType?: 'ai' | 'tts' | 'validation' | 'render' | 'interrupted';
+  artifactId?: string;
 }
 
 const progressByState: Record<JobState, number> = {
@@ -50,6 +57,8 @@ interface QueuedJob {
   jobId: string;
   request?: HybridRenderRequest;
   v2Request?: LessonRequestV2;
+  v2Artifact?: ApprovedRenderArtifactV2;
+  authorizeArtifact?: (artifact: ApprovedRenderArtifactV2) => boolean | Promise<boolean>;
 }
 interface Store { jobs: Map<string, JobRecord>; queue: QueuedJob[]; active: number; }
 
@@ -89,7 +98,19 @@ async function runEntry(entry: QueuedJob): Promise<void> {
   try {
     let result: { outputPath: string };
 
-    if (entry.v2Request) {
+    if (entry.v2Artifact) {
+      if (entry.authorizeArtifact && !(await entry.authorizeArtifact(entry.v2Artifact))) {
+        throw new Error('artifact_revoked: Approved artifact is no longer authorized for rendering');
+      }
+      result = await runHybridPipelineV2(entry.v2Artifact, {
+        jobId: entry.jobId,
+        documentStore,
+        authorizeArtifact: entry.authorizeArtifact,
+        onStage: (stage) => {
+          if (stage !== 'completed') transition(entry.jobId, stage);
+        }
+      });
+    } else if (entry.v2Request) {
       result = await runHybridPipelineV2(entry.v2Request, {
         jobId: entry.jobId,
         documentStore,
@@ -153,14 +174,27 @@ function pump(): void {
   }
 }
 
-export function createJob(input: unknown): Omit<JobRecord, 'outputPath'> {
+function assertQueueCapacity(): void {
+  const maxPending = getMaxPendingJobs();
+  if (store.active + store.queue.length >= maxPending) {
+    throw new SecurityError(
+      429,
+      'queue_full',
+      `Render queue is full (${store.active + store.queue.length}/${maxPending} active or pending jobs). Please wait for current jobs to finish.`
+    );
+  }
+}
+
+export function createJob(input: unknown, ownerId = 'local-default'): Omit<JobRecord, 'outputPath'> {
+  assertQueueCapacity();
   const request = HybridRenderRequestSchema.parse(input);
   if (request.renderMode === 'live' && !process.env.GEMINI_API_KEY) throw new Error('live_mode_unavailable: GEMINI_API_KEY is not configured');
   if (request.voiceoverMode === 'provided_audio') throw new Error('provided_audio_web_unavailable: use the trusted local CLI with --provided-audio');
   if (request.voiceoverMode === 'google_cloud_tts' && !process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.GOOGLE_CLOUD_PROJECT && process.env.GOOGLE_TTS_ENABLED !== 'true') throw new Error('tts_unavailable: Google Cloud authentication is not configured');
+  if (request.voiceoverMode === 'gemini_tts' && !process.env.GEMINI_API_KEY) throw new Error('tts_api_key_missing: GEMINI_API_KEY is required for Gemini TTS');
   const jobId = createHybridJobId();
   const now = new Date().toISOString();
-  const job: JobRecord = { jobId, status: 'queued', progress: 0, message: messageByState.queued, renderMode: request.renderMode, voiceoverMode: request.voiceoverMode, subtitlesEnabled: request.subtitlesEnabled, createdAt: now, updatedAt: now };
+  const job: JobRecord = { jobId, ownerId, status: 'queued', progress: 0, message: messageByState.queued, renderMode: request.renderMode, voiceoverMode: request.voiceoverMode, subtitlesEnabled: request.subtitlesEnabled, createdAt: now, updatedAt: now };
   store.jobs.set(jobId, job);
   repository.save(job);
   store.queue.push({ jobId, request });
@@ -168,21 +202,27 @@ export function createJob(input: unknown): Omit<JobRecord, 'outputPath'> {
   return publicJob(job);
 }
 
-export function createV2Job(input: unknown): Omit<JobRecord, 'outputPath'> {
+export function createV2Job(input: unknown, ownerId = 'local-default'): Omit<JobRecord, 'outputPath'> {
+  assertQueueCapacity();
   const v2Request = LessonRequestV2Schema.parse(input);
   if (v2Request.renderMode === 'live' && !process.env.GEMINI_API_KEY) {
     throw new Error('live_mode_unavailable: GEMINI_API_KEY is not configured');
+  }
+  if (v2Request.narrationMode === 'gemini_tts' && !process.env.GEMINI_API_KEY) {
+    throw new Error('tts_api_key_missing: GEMINI_API_KEY is required for Gemini TTS');
   }
   const jobId = createHybridJobId();
   const now = new Date().toISOString();
   const job: JobRecord = {
     jobId,
+    ownerId,
     status: 'queued',
     progress: 0,
     message: messageByState.queued,
     renderMode: v2Request.renderMode,
     voiceoverMode: v2Request.narrationMode,
-    subtitlesEnabled: true,
+    visualStyleId: v2Request.visualStyleId ?? 'clean_educational_infographic',
+    subtitlesEnabled: v2Request.subtitlesEnabled ?? true,
     createdAt: now,
     updatedAt: now
   };
@@ -193,11 +233,83 @@ export function createV2Job(input: unknown): Omit<JobRecord, 'outputPath'> {
   return publicJob(job);
 }
 
-export function getJob(jobId: string): Omit<JobRecord, 'outputPath'> | undefined {
-  const job = store.jobs.get(jobId); return job ? publicJob(job) : undefined;
+export function createV2JobFromArtifact(
+  input: unknown,
+  authorizeArtifact?: (artifact: ApprovedRenderArtifactV2) => boolean | Promise<boolean>,
+  ownerId = 'local-default'
+): Omit<JobRecord, 'outputPath'> {
+  const artifact = ApprovedRenderArtifactV2Schema.parse(input);
+  if (!verifyArtifactIntegrity(artifact)) {
+    throw new Error('artifact_tampered: Approved render artifact content hash does not match canonical payload');
+  }
+  if (authorizeArtifact) {
+    const isAuthorized = authorizeArtifact(artifact);
+    if (isAuthorized === false) {
+      throw new SecurityError(403, 'artifact_unauthorized', 'Approved render artifact is not authorized for scheduling');
+    }
+  }
+  if (artifact.renderConfig.renderMode === 'live' && !process.env.GEMINI_API_KEY) {
+    throw new Error('live_mode_unavailable: GEMINI_API_KEY is not configured');
+  }
+  if (artifact.renderConfig.narrationMode === 'gemini_tts' && !process.env.GEMINI_API_KEY) {
+    throw new Error('tts_api_key_missing: GEMINI_API_KEY is required for Gemini TTS');
+  }
+  const existing = Array.from(store.jobs.values()).find((job) =>
+    job.artifactId === artifact.artifactId &&
+    job.ownerId === ownerId &&
+    job.status !== 'failed' &&
+    job.status !== 'interrupted'
+  );
+  if (existing) return publicJob(existing);
+  assertQueueCapacity();
+  const jobId = createHybridJobId();
+  const now = new Date().toISOString();
+  const job: JobRecord = {
+    jobId,
+    ownerId,
+    status: 'queued',
+    progress: 0,
+    message: messageByState.queued,
+    renderMode: artifact.renderConfig.renderMode,
+    voiceoverMode: artifact.renderConfig.narrationMode,
+    visualStyleId: artifact.renderConfig.visualStyleId ?? 'clean_educational_infographic',
+    subtitlesEnabled: artifact.renderConfig.subtitlesEnabled ?? true,
+    artifactId: artifact.artifactId,
+    createdAt: now,
+    updatedAt: now
+  };
+  store.jobs.set(jobId, job);
+  repository.save(job);
+  store.queue.push({ jobId, v2Artifact: artifact, authorizeArtifact });
+  pump();
+  return publicJob(job);
 }
 
-export function getJobOutputPath(jobId: string): string | undefined {
-  const job = store.jobs.get(jobId); return job?.status === 'completed' ? job.outputPath : undefined;
+export function getQueueStatus(): { active: number; queueLength: number; maxPending: number; isFull: boolean } {
+  const maxPending = getMaxPendingJobs();
+  return {
+    active: store.active,
+    queueLength: store.queue.length,
+    maxPending,
+    isFull: store.active + store.queue.length >= maxPending
+  };
+}
+
+export function getJob(jobId: string, callerOwnerId?: string): Omit<JobRecord, 'outputPath'> | undefined {
+  const job = store.jobs.get(jobId);
+  if (!job) return undefined;
+  if (callerOwnerId) {
+    assertOwnerMatch(job.ownerId, callerOwnerId, `job '${jobId}'`);
+  }
+  return publicJob(job);
+}
+
+export function getJobOutputPath(jobId: string, callerOwnerId?: string): string | undefined {
+  const job = store.jobs.get(jobId);
+  if (!job) return undefined;
+  if (callerOwnerId) {
+    assertOwnerMatch(job.ownerId, callerOwnerId, `job '${jobId}'`);
+  }
+  return job.status === 'completed' ? job.outputPath : undefined;
 }
 

@@ -10,7 +10,9 @@ import {
   useVideoConfig
 } from 'remotion';
 import { Audio } from '@remotion/media';
+import { ConceptTitleReveal, StepFormulaReveal } from '@luminalearn/animation';
 import {
+  LUMINA_VERTICAL_LAYOUT,
   RenderManifestV2Schema,
   type RenderManifestV2,
   type TimelineSceneV2
@@ -86,9 +88,26 @@ const DynamicTextScene: React.FC<{ scene: TimelineSceneV2 }> = ({ scene }) => {
   );
 
   const formulas = scene.content.formulas ?? [];
+  const chalkboard = scene.parameters.visualStyleId === 'math_chalkboard';
+  const sceneShellStyle: React.CSSProperties = chalkboard
+    ? { ...shellStyle, backgroundColor: '#102A24', backgroundImage: 'radial-gradient(circle at 50% 30%, rgba(245,241,223,.06), transparent 55%)', color: '#F5F1DF' }
+    : shellStyle;
+
+  if (isIntro) {
+    return (
+      <AbsoluteFill style={sceneShellStyle}>
+        <BrandHeader />
+        <ConceptTitleReveal
+          title={scene.content.title}
+          eyebrow={scene.content.eyebrow}
+          accentColor={colors.cyan}
+        />
+      </AbsoluteFill>
+    );
+  }
 
   return (
-    <AbsoluteFill style={shellStyle}>
+    <AbsoluteFill style={sceneShellStyle}>
       <BrandHeader />
       <div
         style={{
@@ -112,41 +131,11 @@ const DynamicTextScene: React.FC<{ scene: TimelineSceneV2 }> = ({ scene }) => {
           {scene.content.title}
         </div>
         {scene.content.body ? (
-          <div style={{ marginTop: 26, color: colors.muted, fontSize: 27, lineHeight: 1.45 }}>
+          <div style={{ marginTop: 26, color: colors.muted, fontSize: LUMINA_VERTICAL_LAYOUT.bodyFontPx, lineHeight: 1.45 }}>
             {scene.content.body}
           </div>
         ) : null}
-        {formulas.length ? (
-          <div style={{ marginTop: 36, display: 'flex', flexDirection: 'column', gap: 18 }}>
-            {formulas.map((formula, index) => {
-              const formulaOpacity = interpolate(
-                frame,
-                [18 + index * 25, 28 + index * 25],
-                [0, 1],
-                { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
-              );
-              const isHighlight = index === formulas.length - 1;
-              return (
-                <div
-                  key={formula}
-                  style={{
-                    opacity: formulaOpacity,
-                    padding: '20px 24px',
-                    borderRadius: 18,
-                    background: 'rgba(15,23,42,.92)',
-                    border: `1px solid ${isHighlight ? colors.violet : '#1E3A5F'}`,
-                    color: isHighlight ? colors.violet : colors.text,
-                    fontSize: 28,
-                    fontWeight: 700,
-                    textAlign: 'center'
-                  }}
-                >
-                  {formula}
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
+        {formulas.length ? <StepFormulaReveal formulas={formulas} accentColor={colors.violet} /> : null}
       </div>
     </AbsoluteFill>
   );
@@ -168,7 +157,6 @@ const DynamicMathClipScene: React.FC<{
         muted
         style={{ width: '100%', height: '100%', objectFit: 'cover' }}
       />
-      <BrandHeader />
     </AbsoluteFill>
   );
 };
@@ -181,6 +169,10 @@ const DynamicSubtitleOverlay: React.FC<{ manifest: RenderManifestV2 }> = ({ mani
     (candidate) => frame >= candidate.startFrame && frame < candidate.endFrame
   );
   if (!cue) return null;
+  const activeScene = manifest.timeline.find(
+    (scene) => frame >= scene.startFrame && frame < scene.startFrame + scene.durationFrames
+  );
+  const overlaysVerifiedMath = Boolean(activeScene?.assetId);
 
   return (
     <div
@@ -189,7 +181,7 @@ const DynamicSubtitleOverlay: React.FC<{ manifest: RenderManifestV2 }> = ({ mani
         zIndex: 40,
         left: 48,
         right: 48,
-        bottom: 58,
+        bottom: overlaysVerifiedMath ? LUMINA_VERTICAL_LAYOUT.subtitleMathClipBottomPx : LUMINA_VERTICAL_LAYOUT.subtitleNormalBottomPx,
         display: 'flex',
         justifyContent: 'center',
         pointerEvents: 'none'
@@ -197,15 +189,15 @@ const DynamicSubtitleOverlay: React.FC<{ manifest: RenderManifestV2 }> = ({ mani
     >
       <div
         style={{
-          maxWidth: 620,
-          padding: '13px 20px',
+          maxWidth: LUMINA_VERTICAL_LAYOUT.subtitleMaxWidthPx,
+          padding: `${LUMINA_VERTICAL_LAYOUT.subtitleVerticalPaddingPx}px ${LUMINA_VERTICAL_LAYOUT.subtitleHorizontalPaddingPx}px`,
           borderRadius: 14,
           background: 'rgba(3, 8, 18, .9)',
           border: '1px solid rgba(148, 163, 184, .28)',
           color: colors.text,
-          fontSize: 25,
+          fontSize: LUMINA_VERTICAL_LAYOUT.subtitleFontPx,
           fontWeight: 700,
-          lineHeight: 1.35,
+          lineHeight: LUMINA_VERTICAL_LAYOUT.subtitleLineHeight,
           textAlign: 'center',
           whiteSpace: 'pre-line',
           boxShadow: '0 8px 30px rgba(0,0,0,.4)'
