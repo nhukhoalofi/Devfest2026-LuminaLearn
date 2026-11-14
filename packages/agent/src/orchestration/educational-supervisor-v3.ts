@@ -60,29 +60,58 @@ export class CurriculumPlanningAgent {
     // Derive chapters from the planned duration and topic structure
     const totalDuration = rawPlan.storyboard?.totalDurationSeconds ?? request.targetDurationSeconds;
     const isMath = capability.domain === 'mathematics';
-    const chapters: EducationalChapterPlanV3[] = [
-      {
-        chapterIndex: 0,
-        chapterTitle: `Giới thiệu & Đặt vấn đề: ${capability.displayName}`,
-        targetDurationSeconds: Math.round(totalDuration * 0.25),
-        pedagogicalIntent: 'Kích hoạt tri thức nền tảng và trực giác ban đầu của học viên',
-        keyFormulasOrConcepts: isMath ? [capability.displayName] : ['Trực giác mô hình', capability.displayName]
-      },
-      {
-        chapterIndex: 1,
-        chapterTitle: `Bản chất cốt lõi: ${capability.displayName}`,
-        targetDurationSeconds: Math.round(totalDuration * 0.5),
-        pedagogicalIntent: 'Phân tích cơ chế tính toán, công thức hình thức hoặc cấu trúc thuật toán',
-        keyFormulasOrConcepts: rawPlan.keyConcepts.slice(0, 4)
-      },
-      {
-        chapterIndex: 2,
-        chapterTitle: `Tổng kết & Ứng dụng thực tiễn`,
-        targetDurationSeconds: Math.round(totalDuration * 0.25),
-        pedagogicalIntent: 'Củng cố kiến thức và liên kết với bức tranh tổng thể',
-        keyFormulasOrConcepts: ['Ứng dụng', 'Tổng kết sư phạm']
-      }
-    ];
+    let chapters: EducationalChapterPlanV3[];
+
+    if (totalDuration >= 300) {
+      const dur1 = Math.round(totalDuration * 0.1);
+      const dur2 = Math.round(totalDuration * 0.15);
+      const remainder = totalDuration - (dur1 * 2 + dur2 * 5);
+      chapters = [
+        { chapterIndex: 0, chapterTitle: 'Mục tiêu & Đặt vấn đề', targetDurationSeconds: dur1, pedagogicalIntent: 'Kích hoạt tri thức nền tảng', keyFormulasOrConcepts: [capability.displayName] },
+        { chapterIndex: 1, chapterTitle: 'Mô hình & Định nghĩa cốt lõi', targetDurationSeconds: dur2, pedagogicalIntent: 'Trình bày mô hình hình thức', keyFormulasOrConcepts: rawPlan.keyConcepts.slice(0, 2) },
+        { chapterIndex: 2, chapterTitle: 'Phân tích trực giác hình học', targetDurationSeconds: dur2, pedagogicalIntent: 'Trực quan hóa cơ chế hoạt động', keyFormulasOrConcepts: rawPlan.keyConcepts.slice(1, 3) },
+        { chapterIndex: 3, chapterTitle: 'Động lực học & Tham số', targetDurationSeconds: dur2, pedagogicalIntent: 'Phân tích tham số và biến đổi', keyFormulasOrConcepts: ['Tham số', 'Quy tắc cập nhật'] },
+        { chapterIndex: 4, chapterTitle: 'Ví dụ tính toán từng bước', targetDurationSeconds: dur2, pedagogicalIntent: 'Ví dụ số cụ thể kiểm chứng', keyFormulasOrConcepts: ['Ví dụ số', 'Tính toán'] },
+        { chapterIndex: 5, chapterTitle: 'Trực quan hóa tối ưu hóa', targetDurationSeconds: dur2, pedagogicalIntent: 'Mô phỏng hành vi động', keyFormulasOrConcepts: ['Mô phỏng', 'Đường đi nghiệm'] },
+        { chapterIndex: 6, chapterTitle: 'Phân tích sai lầm thường gặp', targetDurationSeconds: dur1, pedagogicalIntent: 'Cảnh báo ngộ nhận và điểm yếu', keyFormulasOrConcepts: ['Sai lầm', 'Ngộ nhận'] },
+        { chapterIndex: 7, chapterTitle: 'Tổng kết & Ghi nhớ bản chất', targetDurationSeconds: remainder, pedagogicalIntent: 'Củng cố và tổng kết toàn diện', keyFormulasOrConcepts: ['Tổng kết', 'Ghi nhớ'] }
+      ];
+    } else if (totalDuration >= 180) {
+      chapters = [
+        { chapterIndex: 0, chapterTitle: 'Giới thiệu & Đặt vấn đề', targetDurationSeconds: 25, pedagogicalIntent: 'Kích hoạt tri thức nền tảng và trực giác ban đầu', keyFormulasOrConcepts: [capability.displayName] },
+        { chapterIndex: 1, chapterTitle: 'Bản chất cơ chế tính toán', targetDurationSeconds: 35, pedagogicalIntent: 'Phân tích cơ chế và công thức hình thức', keyFormulasOrConcepts: rawPlan.keyConcepts.slice(0, 2) },
+        { chapterIndex: 2, chapterTitle: 'Trực quan hóa quy luật', targetDurationSeconds: 40, pedagogicalIntent: 'Trực quan hóa hoạt động và chuyển động tham số', keyFormulasOrConcepts: rawPlan.keyConcepts.slice(1, 3) },
+        { chapterIndex: 3, chapterTitle: 'Ví dụ chi tiết từng bước', targetDurationSeconds: 45, pedagogicalIntent: 'Tính toán từng bước có kiểm định toán học', keyFormulasOrConcepts: ['Ví dụ số', 'Biến đổi'] },
+        { chapterIndex: 4, chapterTitle: 'Tổng kết sư phạm & Ứng dụng', targetDurationSeconds: totalDuration - (25 + 35 + 40 + 45), pedagogicalIntent: 'Củng cố bài học và lưu ý sư phạm', keyFormulasOrConcepts: ['Tổng kết', 'Ứng dụng'] }
+      ];
+    } else {
+      const part1 = Math.round(totalDuration * 0.25);
+      const part2 = Math.round(totalDuration * 0.5);
+      const part3 = totalDuration - (part1 + part2);
+      chapters = [
+        {
+          chapterIndex: 0,
+          chapterTitle: `Giới thiệu & Đặt vấn đề: ${capability.displayName}`,
+          targetDurationSeconds: part1,
+          pedagogicalIntent: 'Kích hoạt tri thức nền tảng và trực giác ban đầu của học viên',
+          keyFormulasOrConcepts: isMath ? [capability.displayName] : ['Trực giác mô hình', capability.displayName]
+        },
+        {
+          chapterIndex: 1,
+          chapterTitle: `Bản chất cốt lõi: ${capability.displayName}`,
+          targetDurationSeconds: part2,
+          pedagogicalIntent: 'Phân tích cơ chế tính toán, công thức hình thức hoặc cấu trúc thuật toán',
+          keyFormulasOrConcepts: rawPlan.keyConcepts.slice(0, 4)
+        },
+        {
+          chapterIndex: 2,
+          chapterTitle: `Tổng kết & Ứng dụng thực tiễn`,
+          targetDurationSeconds: part3,
+          pedagogicalIntent: 'Củng cố kiến thức và liên kết với bức tranh tổng thể',
+          keyFormulasOrConcepts: ['Ứng dụng', 'Tổng kết sư phạm']
+        }
+      ];
+    }
 
     return { lessonPlan: rawPlan, chapters };
   }
@@ -190,31 +219,51 @@ export class VisualDirectorAgent {
       let cameraMotion: VisualDirectionDecisionV3['cameraMotion'] = 'static';
       let rhythmPacing: VisualDirectionDecisionV3['rhythmPacing'] = 'steady';
 
+      let layoutPreset: VisualDirectionDecisionV3['layoutPreset'] = 'centered_focus';
+      let stylePreset: VisualDirectionDecisionV3['stylePreset'] = 'clean_educational_infographic';
+
       if (scene.sceneType === 'algebra_identity') {
         selectedComponent = 'AlgebraIdentityScene';
-        treatmentRationale = 'Hiển thị biến đổi biểu thức toán học từng bước kết hợp trực quan hóa hình học 2D/3D';
+        treatmentRationale = 'Hiển thị biến đổi biểu thức toán học từng bước kết hợp trực quan hóa hình học 2D/3D (Shotcraft: Split-focus layout, subtitle-safe)';
         cameraMotion = 'zoom_in';
         rhythmPacing = 'dynamic_reveal';
+        layoutPreset = 'split_horizontal';
+        stylePreset = 'clean_educational_infographic';
       } else if (scene.sceneType === 'neural_architecture') {
         selectedComponent = 'NeuralArchitectureScene';
-        treatmentRationale = 'Mô hình hóa kiến trúc mạng nơ-ron, luồng dữ liệu tiến và kích hoạt tế bào';
+        treatmentRationale = 'Mô hình hóa kiến trúc mạng nơ-ron, luồng dữ liệu tiến và kích hoạt tế bào (Shotcraft: High-contrast cyber-glow)';
         cameraMotion = 'slow_pan';
         rhythmPacing = 'dynamic_reveal';
+        layoutPreset = 'centered_focus';
+        stylePreset = 'ai_neural_visualization';
       } else if (scene.sceneType === 'loss_landscape') {
         selectedComponent = 'LossLandscapeScene';
-        treatmentRationale = 'Biểu diễn mặt cong hàm mất mát đa chiều và quỹ đạo dốc giảm dần';
+        treatmentRationale = 'Biểu diễn mặt cong hàm mất mát đa chiều và quỹ đạo dốc giảm dần (Shotcraft: Dual contour-gradient view)';
         cameraMotion = 'focus_pulse';
         rhythmPacing = 'deliberate_pause';
+        layoutPreset = 'split_horizontal';
+        stylePreset = 'ai_neural_visualization';
       } else if (scene.sceneType === 'attention_heatmap') {
         selectedComponent = 'AttentionHeatmapScene';
-        treatmentRationale = 'Biểu diễn ma trận chú ý đa đầu và trọng số softmax trực quan';
+        treatmentRationale = 'Biểu diễn ma trận chú ý đa đầu và trọng số softmax trực quan (Shotcraft: Synchronous query-key highlight)';
         cameraMotion = 'slow_pan';
         rhythmPacing = 'steady';
+        layoutPreset = 'split_horizontal';
+        stylePreset = 'ai_neural_visualization';
+      } else if (scene.sceneType === 'summary') {
+        selectedComponent = 'SummaryScene';
+        treatmentRationale = 'Tổng kết điểm cốt lõi và các mệnh đề đã chứng minh (Shotcraft: Stacked column takeaway)';
+        cameraMotion = 'static';
+        rhythmPacing = 'deliberate_pause';
+        layoutPreset = 'stacked_column';
+        stylePreset = 'clean_educational_infographic';
       } else if (index === 0) {
         selectedComponent = 'ConceptTitleReveal';
         treatmentRationale = 'Mở đầu nhịp độ cao với tiêu đề khái niệm và trực giác dẫn nhập';
         cameraMotion = 'zoom_in';
         rhythmPacing = 'dynamic_reveal';
+        layoutPreset = 'centered_focus';
+        stylePreset = 'clean_educational_infographic';
       }
 
       // Đảm bảo không thay đổi công thức toán đã được liên kết
@@ -225,6 +274,8 @@ export class VisualDirectorAgent {
         treatmentRationale,
         cameraMotion,
         rhythmPacing,
+        layoutPreset,
+        stylePreset,
         visualPayload: scene.visualPayload,
         preservesVerifiedMath: true
       };
@@ -381,37 +432,45 @@ export function validateCrossAgentConsistency(input: {
   const { request, capability, plan, claims, visualDecisions, narrationResults } = input;
   const violations: string[] = [];
 
-  // Check 1: Topic matches domain
-  if (plan.domain !== capability.domain) {
-    violations.push(`Check 1 Failed: Lesson domain '${plan.domain}' does not match capability domain '${capability.domain}'`);
+  // Check 1: Topic and request match capability domain
+  if (plan.domain !== capability.domain || request.domain !== capability.domain) {
+    violations.push(`Check 1 Failed: Lesson domain '${plan.domain}' or request domain '${request.domain}' does not match capability domain '${capability.domain}'`);
   }
 
-  // Check 2: Learning objectives match storyboard content
+  // Check 2: Learning objectives match storyboard pedagogical goals
   if (!plan.learningObjectives || plan.learningObjectives.length === 0) {
     violations.push('Check 2 Failed: Lesson plan has empty learning objectives');
+  } else if (plan.storyboard) {
+    for (const scene of plan.storyboard.scenes) {
+      if (!scene.pedagogicalGoal || scene.pedagogicalGoal.trim().length < 5) {
+        violations.push(`Check 2 Failed: Scene '${scene.sceneId}' lacks clear pedagogical goal`);
+      }
+    }
   }
 
   // Check 3: Scene durations match storyboard timeline
   if (plan.storyboard) {
     const sumDuration = plan.storyboard.scenes.reduce((sum, s) => sum + s.durationSeconds, 0);
-    if (Math.abs(sumDuration - plan.storyboard.totalDurationSeconds) > 1.0) {
+    if (Math.abs(sumDuration - plan.storyboard.totalDurationSeconds) > 0.5) {
       violations.push(`Check 3 Failed: Sum of scene durations (${sumDuration}s) does not match totalDuration (${plan.storyboard.totalDurationSeconds}s)`);
     }
   }
 
-  // Check 4: Narration explains correct scene
+  // Check 4: Narration explains correct scene with Vietnamese depth
   if (plan.storyboard) {
     for (const scene of plan.storyboard.scenes) {
-      if (!scene.narration?.vietnamese || scene.narration.vietnamese.trim().length < 5) {
+      if (!scene.narration?.vietnamese || scene.narration.vietnamese.trim().length < 8) {
         violations.push(`Check 4 Failed: Scene '${scene.sceneId}' lacks sufficient Vietnamese narration`);
       }
     }
   }
 
-  // Check 5: Subtitles match intended narration
+  // Check 5: Subtitles match intended narration and avoid timing overflow
   for (const nr of narrationResults) {
     if (!nr.subtitleVietnamese || nr.subtitleVietnamese.trim().length === 0) {
       violations.push(`Check 5 Failed: Scene '${nr.sceneId}' has empty subtitle`);
+    } else if (nr.subtitleVietnamese.length > nr.narrationVietnamese.length + 50) {
+      violations.push(`Check 5 Failed: Scene '${nr.sceneId}' subtitle is longer than narration text`);
     }
   }
 
@@ -427,13 +486,20 @@ export function validateCrossAgentConsistency(input: {
     }
   }
 
-  // Check 7: Algebra transformations are valid
+  // Check 7: Algebra transformations are valid and intermediate steps are sound
   if (plan.storyboard) {
     for (const scene of plan.storyboard.scenes) {
       if (scene.sceneType === 'algebra_identity') {
         const payload = scene.visualPayload as AlgebraIdentityVisualPayload;
         if (!payload.transformationSteps || payload.transformationSteps.length < 2) {
           violations.push(`Check 7 Failed: Scene '${scene.sceneId}' has fewer than 2 algebra transformation steps`);
+        } else {
+          for (let stepIdx = 0; stepIdx < payload.transformationSteps.length; stepIdx++) {
+            const expr = payload.transformationSteps[stepIdx].expression;
+            if (!/^[a-b0-9+\-*/^() ]+$/.test(expr)) {
+              violations.push(`Check 7 Failed: Scene '${scene.sceneId}' transformation step ${stepIdx} contains invalid symbols: '${expr}'`);
+            }
+          }
         }
       }
     }
@@ -448,17 +514,43 @@ export function validateCrossAgentConsistency(input: {
     }
   }
 
-  // Check 9: All scene components are supported
+  // Check 9: All scene components are in the registered allowlist
+  const allowedComponents = new Set([
+    'AlgebraIdentityScene',
+    'DerivativeSecantTangentScene',
+    'RiemannSumScene',
+    'NeuralArchitectureScene',
+    'LossLandscapeScene',
+    'AttentionHeatmapScene',
+    'SummaryScene',
+    'ConceptTitleReveal',
+    'GenericEducationalScene'
+  ]);
   for (const decision of visualDecisions) {
-    if (!decision.selectedComponent) {
-      violations.push(`Check 9 Failed: Scene '${decision.sceneId}' has no visual component selected`);
+    if (!decision.selectedComponent || !allowedComponents.has(decision.selectedComponent)) {
+      violations.push(`Check 9 Failed: Scene '${decision.sceneId}' uses unregistered or unsupported visual component '${decision.selectedComponent}'`);
     }
   }
 
-  // Check 10: No agent mutates previously verified mathematical facts
+  // Check 10: Invariant check on visual payload equations preserving verified mathematical claims
   for (const decision of visualDecisions) {
     if (!decision.preservesVerifiedMath) {
       violations.push(`Check 10 Failed: Visual decision for '${decision.sceneId}' modified verified mathematical facts`);
+    }
+  }
+  if (plan.storyboard) {
+    for (const scene of plan.storyboard.scenes) {
+      if (scene.sceneType === 'algebra_identity') {
+        const payload = scene.visualPayload as AlgebraIdentityVisualPayload;
+        const matchingClaim = claims.find((c) => scene.boundClaimIds.includes(c.id));
+        if (matchingClaim && matchingClaim.formalExpression) {
+          const expectedExpr = `${payload.leftExpression}=${payload.rightExpression}`.replace(/\s+/g, '');
+          const claimExpr = matchingClaim.formalExpression.replace(/\s+/g, '');
+          if (expectedExpr !== claimExpr) {
+            violations.push(`Check 10 Failed: Visual payload equation '${expectedExpr}' in scene '${scene.sceneId}' diverges from verified claim '${claimExpr}'`);
+          }
+        }
+      }
     }
   }
 
@@ -722,12 +814,12 @@ export class EducationalSupervisorV3 {
       const msg = err instanceof Error ? err.message : String(err);
       finishTask(t7, 'failed', 'advisory_warning', 'composite', undefined, 'pedagogical_review_failed', msg);
       qualityReview = {
-        passed: true,
-        explanationClarityScore: 6,
+        passed: false,
+        explanationClarityScore: 1,
         unsupportedStatements: [],
         contradictionsDetected: [],
-        revisionsRequested: [],
-        reviewNotes: 'Thẩm định sư phạm chạy ở chế độ dự phòng an toàn.'
+        revisionsRequested: ['Cần giáo viên thẩm định thủ công do hệ thống thẩm định sư phạm tự động gặp sự cố'],
+        reviewNotes: `Hệ thống thẩm định sư phạm tự động không khả dụng: ${msg}. Bản thảo chuyển sang chế độ giáo viên tự rà soát thủ công.`
       };
     }
 
@@ -755,24 +847,33 @@ export class EducationalSupervisorV3 {
     // ------------------------------------------------------------------------
     const t9 = recordTask('task_9_draft_assembly', 'supervisor', 'Tập hợp bản thảo V3 hoàn chỉnh cho giáo viên phê duyệt', capability.topicId, [t8.taskId]);
     const draftId = `draft_${request.requestId}_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
-    const nowIso = new Date().toISOString();
-    const finalDraft: LessonDraftV3 = {
-      draftId,
-      ownerId: request.ownerId,
-      version: 1,
-      status: 'needs_review',
-      request: {
-        ...request,
-        width: 720,
-        height: 1280,
-        fps: 24
-      },
-      lessonPlan,
-      semanticReviewConfirmed: false,
-      createdAt: nowIso,
-      updatedAt: nowIso
+    const lessonRequest: LessonRequestV3 = {
+      requestId: request.requestId,
+      topic: request.topic,
+      domain: request.domain,
+      generationMode: request.generationMode,
+      targetDurationSeconds: request.targetDurationSeconds,
+      narrationMode: request.narrationMode,
+      subtitlesEnabled: request.subtitlesEnabled,
+      fps: 24,
+      width: 720,
+      height: 1280
     };
-    finishTask(t9, 'completed', 'passed', 'composite', { draftId, version: 1 });
+
+    let persistedDraft: LessonDraftV3;
+    try {
+      persistedDraft = await this.draftManager.saveSupervisorDraft({
+        ownerId: request.ownerId,
+        request: lessonRequest,
+        lessonPlan,
+        draftId
+      });
+      finishTask(t9, 'completed', 'passed', 'composite', { draftId: persistedDraft.draftId, version: persistedDraft.version });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      finishTask(t9, 'failed', 'failed', 'composite', undefined, 'draft_persistence_failed', msg);
+      throw err;
+    }
 
     // ------------------------------------------------------------------------
     // FINAL TRACE & SUMMARY
@@ -789,11 +890,11 @@ export class EducationalSupervisorV3 {
       retryCount: 0,
       budgetUsage: { geminiApiCalls, maxApiCalls: this.maxApiCalls },
       status: 'needs_teacher_review',
-      humanReadableSummary: `Bài học V3 "${capability.displayName}" đã được 6 Agent chuyên trách xây dựng thành công trong ${elapsedMs}ms. Toàn bộ ${verifiedClaims.length} mệnh đề toán học đã vượt qua kiểm định SymPy. Kịch bản Remotion và lời giảng tiếng Việt đã sẵn sàng để Giáo viên rà soát và phê duyệt.`
+      humanReadableSummary: `Bài học V3 "${capability.displayName}" đã được 6 Agent chuyên trách xây dựng thành công trong ${elapsedMs}ms. Toàn bộ ${verifiedClaims.length} mệnh đề toán học đã vượt qua kiểm định SymPy. Kịch bản Remotion và lời giảng tiếng Việt đã sẵn sàng để Giáo viên rà soát và phê duyệt. Bản thảo đã được lưu trữ an toàn.`
     };
 
     return {
-      draftId,
+      draftId: persistedDraft.draftId,
       lessonPlan,
       capabilityReport: capability,
       trace,

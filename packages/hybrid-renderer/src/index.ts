@@ -14,4 +14,9 @@ export * from './pipeline-v2';
 export * from './pipeline-v3';
 export * from './visual-qa';
 export * from './environment';
+export * from './longform-assembler-v3';
+export * from './longform-renderer-v3';
+export * from './vietnamese-narration-normalizer';
+export * from './audio-cache-manager';
+export * from './scene-audio-synchronizer';
 

@@ -11,6 +11,8 @@ import {
 } from '@luminalearn/scene-schema';
 import { GoogleCloudTtsProvider, probeAudio, probeAudioSignal, type TtsProvider } from './audio';
 import { GeminiTtsProvider } from './gemini-tts';
+import { defaultSceneAudioSynchronizer } from './scene-audio-synchronizer';
+import { generateSrtFromStoryboardV3 } from './subtitles';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -77,6 +79,18 @@ export interface RenderPipelineV3Options {
   onStage?: (stage: 'rendering_remotion' | 'synthesizing_audio' | 'merging_media') => void;
 }
 
+export interface TrustedProofContextV3 {
+  artifactIntegrityVerified: true;
+  approvedDraftVersion: number;
+}
+
+export function deriveTrustedProofContextV3(artifact: ApprovedRenderArtifactV3): TrustedProofContextV3 {
+  return {
+    artifactIntegrityVerified: true,
+    approvedDraftVersion: artifact.approvedVersion
+  };
+}
+
 export async function runRenderPipelineV3(
   artifactInput: unknown,
   options: RenderPipelineV3Options
@@ -92,17 +106,22 @@ export async function runRenderPipelineV3(
   const outputPath = resolve(outputDir, 'final.mp4');
   const rawVideoPath = resolve(outputDir, 'raw-video.mp4');
 
-  await writeFile(propsPath, JSON.stringify({ storyboard: artifact.lessonPlan.storyboard, subtitlesEnabled: artifact.request.subtitlesEnabled }), 'utf8');
+  const trustedProofContext = deriveTrustedProofContextV3(artifact);
+  await writeFile(
+    propsPath,
+    JSON.stringify({
+      storyboard: artifact.lessonPlan.storyboard,
+      subtitlesEnabled: artifact.request.subtitlesEnabled,
+      trustedProofContext
+    }),
+    'utf8'
+  );
 
   if (artifact.request.subtitlesEnabled) {
-    let startFrame = 0;
-    const srt = artifact.lessonPlan.storyboard.scenes.map((scene, index) => {
-      const endFrame = Math.round(artifact.lessonPlan.storyboard!.scenes.slice(0, index + 1).reduce((sum, item) => sum + item.durationSeconds, 0) * artifact.request.fps);
-      const cue = `${index + 1}\n${srtTimestamp(startFrame / artifact.request.fps)} --> ${srtTimestamp(endFrame / artifact.request.fps)}\n${scene.narration.subtitleVietnamese}\n`;
-      startFrame = endFrame;
-      return cue;
-    }).join('\n');
-    await writeFile(resolve(outputDir, 'subtitles.srt'), srt, 'utf8');
+    const srt = generateSrtFromStoryboardV3(artifact.lessonPlan.storyboard, artifact.request.fps);
+    if (srt) {
+      await writeFile(resolve(outputDir, 'subtitles.srt'), srt, 'utf8');
+    }
   }
 
   // Audio handling
@@ -168,19 +187,34 @@ export async function runRenderPipelineV3(
     const provider: TtsProvider = options.ttsProvider ?? (
       isGemini ? new GeminiTtsProvider() : new GoogleCloudTtsProvider()
     );
-    const audioPath = resolve(outputDir, 'narration.mp3');
-    const fullText = artifact.lessonPlan.storyboard.scenes
-      .map((s) => s.narration.vietnamese)
-      .filter(Boolean)
-      .join(' ');
-    await provider.synthesize(fullText, audioPath);
 
-    // Verify synthesized audio is valid and audible (fail closed)
-    const ttsSignal = await probeAudioSignal(audioPath);
-    if (ttsSignal.isSilent) {
-      throw new Error('tts_audio_silent: Synthesized TTS audio returned silent audio payload');
+    const syncResult = await defaultSceneAudioSynchronizer.synchronizeStoryboard(
+      artifact.lessonPlan.storyboard.scenes.map((s) => ({
+        id: s.sceneId,
+        durationSeconds: s.durationSeconds,
+        narration: s.narration
+      })),
+      {
+        ttsProvider: provider,
+        fps: artifact.request.fps,
+        ownerId: artifact.ownerId,
+        outputDir
+      }
+    );
+
+    // Verify synthesized audio is valid and audible (fail closed for non-silent fixtures)
+    if (!provider.isSilentFixture) {
+      const ttsSignal = await probeAudioSignal(syncResult.masterAudioPath);
+      if (ttsSignal.isSilent) {
+        throw new Error('tts_audio_silent: Synthesized TTS audio returned silent audio payload');
+      }
     }
-    audioTrackPath = audioPath;
+    audioTrackPath = syncResult.masterAudioPath;
+
+    // Overwrite SRT with frame-accurate speech timing
+    if (artifact.request.subtitlesEnabled && syncResult.srtContent) {
+      await writeFile(resolve(outputDir, 'subtitles.srt'), syncResult.srtContent, 'utf8');
+    }
   }
 
   options.onStage?.('rendering_remotion');

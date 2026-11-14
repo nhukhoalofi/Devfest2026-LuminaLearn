@@ -5,7 +5,7 @@ import {
   RendererTargetSchema,
   TopicCapabilityReportV3Schema
 } from './capability';
-import { EducationalVisualPayloadSchema, type EducationalVisualPayload } from './visual-dsl';
+import { EducationalVisualPayloadSchema, VisualSceneDefinitionV3Schema, type EducationalVisualPayload } from './visual-dsl';
 
 export const LESSON_SCHEMA_VERSION_V3 = 'lesson-v3' as const;
 export const GenerationProvenanceV3Schema = z.enum(['deterministic_mock', 'ai_generated_live']);
@@ -132,7 +132,8 @@ export const EducationalSceneV3Schema = z.object({
     vietnamese: NoExecutableString,
     subtitleVietnamese: NoExecutableString
   }).strict(),
-  visualPayload: EducationalVisualPayloadSchema
+  visualPayload: EducationalVisualPayloadSchema,
+  visualDefinition: VisualSceneDefinitionV3Schema.optional()
 }).strict().superRefine((scene, ctx) => {
   if (scene.visualPayload.sceneType !== scene.sceneType) {
     ctx.addIssue({
@@ -140,6 +141,9 @@ export const EducationalSceneV3Schema = z.object({
       path: ['visualPayload', 'sceneType'],
       message: `visualPayload.sceneType (${scene.visualPayload.sceneType}) không khớp với scene.sceneType (${scene.sceneType})`
     });
+  }
+  if (scene.visualDefinition && scene.visualDefinition.sceneId !== scene.sceneId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['visualDefinition', 'sceneId'], message: 'Visual DSL sceneId phải khớp scene được duyệt' });
   }
 });
 
@@ -151,8 +155,9 @@ export type EducationalSceneV3 = z.infer<typeof EducationalSceneV3Schema>;
 export const EducationalStoryboardV3Schema = z.object({
   storyboardId: SafeIdString,
   lessonId: SafeIdString,
-  scenes: z.array(EducationalSceneV3Schema).min(2).max(12),
-  totalDurationSeconds: z.number().positive().max(600)
+  scenes: z.array(EducationalSceneV3Schema).min(2).max(60),
+  totalDurationSeconds: z.number().positive().max(600),
+  chapters: z.array(z.record(z.string(), z.unknown())).optional()
 }).strict().superRefine((sb, ctx) => {
   const sumDuration = sb.scenes.reduce((acc, sc) => acc + sc.durationSeconds, 0);
   if (Math.abs(sumDuration - sb.totalDurationSeconds) > 1.0) {

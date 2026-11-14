@@ -5,4 +5,6 @@ export * from './AttentionHeatmapScene';
 export * from './SummaryScene';
 export * from './GenericPlotScene';
 export * from './AlgebraIdentityScene';
+export * from './VisualDslSceneV3';
+export * from './graph-math';
 
