@@ -1,0 +1,10 @@
+Feature,Task,Sub-Task,PIC,Duration (hours),Status,Note
+"Project Brief","Scope and provenance","Define physics-first MVP; disclose inherited Phase 1–5 tree; request organizer guidance","TV1",0.5,"Brief written / eligibility pending","PROJECT_BRIEF.md; prepare before official start"
+"Feature 1 - Frontend","Create-video UI","Single stable-width 3-step create flow; mobile safe areas","TV3",1.0,"To do","P0: Topic → review → render"
+"Feature 2 - AI Service","Gemini storyboard","Structured new-topic educational plan; schema validation","TV1",1.5,"To do","P0: no hardcoded success"
+"Feature 3 - Validation","Science verification and approval","Reject unsupported facts; preserve teacher review","TV1 + TV2",1.0,"To do","P0: gate before render"
+"Feature 4 - Video Engine","Optics motion graphics","Ray-circle intersections; Snell/reflection; vertical MP4 QA","TV2",2.0,"To do","P0: rainbow main demo"
+"Feature 5 - Audio","DUTAI TTS Bảo Trang","Authenticated WAV; scene sync; subtitle; quota errors","TV3",1.0,"To do","P1: external consent required"
+"Feature 6 - Album","Curate demo videos","Only playable approved local videos or validated YouTube embeds","TV3",1.0,"To do","P1: no fake placeholders"
+"Web Demo","Integration and tests","E2E create/verify/render/play; capture frames and actual audio evidence","All",1.5,"To do","P1: full demo gate"
+"Web Demo","Release readiness","README; attribution; security; fallback; rehearse judges' demo","All",1.0,"To do","P1: disclose limitations"
