@@ -4,8 +4,11 @@ import { useEffect, useState } from 'react';
 
 type Claim = { id: string; statement: string; verificationStatus: string; claimType: string };
 type Scene = { sceneId: string; title: string; sceneType: string; durationSeconds: number; narration: { vietnamese: string; subtitleVietnamese: string }; visualPayload: unknown };
+type AgentTask = { taskId: string; role: string; title: string; status: string; validationStatus: string; durationMs?: number };
+type SupervisorTrace = { supervisorRunId: string; status: string; elapsedMs: number; humanReadableSummary: string; tasks: AgentTask[] };
 type Draft = {
   draftId: string; version: number; status: string; semanticReviewConfirmed: boolean;
+  approvedArtifact?: { artifactId: string; contentHash: string };
   lessonPlan: {
     title: string; generationProvenance: string; learningObjectives: string[];
     educationalClaims: Claim[]; storyboard?: { totalDurationSeconds: number; scenes: Scene[] };
@@ -18,8 +21,11 @@ type Job = { jobId: string; status: string; progress: number; message: string; v
 export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
   const [topic, setTopic] = useState('Perceptron và nguyên lý hoạt động của mạng nơ-ron nhân tạo');
   const [mode, setMode] = useState<'mock' | 'live'>('mock');
+  const [domain, setDomain] = useState<'mathematics' | 'artificial_intelligence'>('artificial_intelligence');
+  const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
   const [confirmExternalApi, setConfirmExternalApi] = useState(false);
   const [draft, setDraft] = useState<Draft>();
+  const [trace, setTrace] = useState<SupervisorTrace>();
   const [job, setJob] = useState<Job>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -41,14 +47,52 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
   }
 
   async function generate() {
-    setBusy(true); setError(''); setJob(undefined);
+    setBusy(true); setError(''); setJob(undefined); setTrace(undefined);
     try {
-      setDraft(await jsonRequest('/api/v3/lessons/draft', 'POST', {
-        requestId: `req_v3_${Date.now()}`, topic, domain: 'artificial_intelligence', generationMode: mode,
-        targetDurationSeconds: 35, narrationMode: 'none', subtitlesEnabled: true,
+      const responseData = await jsonRequest('/api/v3/supervisor', 'POST', {
+        requestId: `req_v3_${Date.now()}`, topic, domain, generationMode: mode,
+        targetDurationSeconds: 40, narrationMode: 'none', subtitlesEnabled,
         fps: 24, width: 720, height: 1280, confirmExternalApi
-      }));
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+      });
+      if (responseData.trace) {
+        setTrace(responseData.trace);
+      }
+      setDraft({
+        draftId: responseData.draftId,
+        version: 1,
+        status: 'needs_review',
+        semanticReviewConfirmed: false,
+        lessonPlan: responseData.lessonPlan
+      });
+    } catch (err) {
+      // Fallback sang endpoint draft tiêu chuẩn nếu cần
+      try {
+        setDraft(await jsonRequest('/api/v3/lessons/draft', 'POST', {
+          requestId: `req_v3_${Date.now()}`, topic, domain, generationMode: mode,
+          targetDurationSeconds: 35, narrationMode: 'none', subtitlesEnabled,
+          fps: 24, width: 720, height: 1280, confirmExternalApi
+        }));
+      } catch (fallbackErr) {
+        setError(fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
+      }
+    }
+    finally { setBusy(false); }
+  }
+
+  async function retryEnqueue() {
+    if (!draft?.approvedArtifact) return;
+    setBusy(true); setError('');
+    try {
+      const result = await jsonRequest(`/api/v3/lessons/${draft.draftId}/enqueue`, 'POST', draft.approvedArtifact);
+      setJob(result.job);
+    } catch (err) {
+      const failure = err as Error & { status?: number };
+      if (failure.status === 429) {
+        const response = await fetch(`/api/v3/lessons/${draft.draftId}/draft`, { cache: 'no-store' });
+        if (response.ok) setDraft(await response.json());
+        setError('Bản duyệt đã được giữ an toàn nhưng hàng đợi đang đầy. Hãy thử xếp hàng lại khi có chỗ trống.');
+      } else setError(failure.message);
+    }
     finally { setBusy(false); }
   }
 
@@ -85,7 +129,14 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
     try {
       const result = await jsonRequest(`/api/v3/lessons/${draft.draftId}/approve`, 'POST', { expectedVersion: draft.version, note: 'Teacher approved from V3 Studio' });
       setDraft(result.draft); setJob(result.job);
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    } catch (err) {
+      const failure = err as Error & { status?: number };
+      if (failure.status === 429) {
+        const response = await fetch(`/api/v3/lessons/${draft.draftId}/draft`, { cache: 'no-store' });
+        if (response.ok) setDraft(await response.json());
+        setError('Bản duyệt đã được giữ an toàn nhưng hàng đợi đang đầy. Hãy thử xếp hàng lại khi có chỗ trống.');
+      } else setError(failure.message);
+    }
     finally { setBusy(false); }
   }
 
@@ -94,9 +145,23 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
       <h2 id="v3-studio-title">V3 Teacher Studio — AI & Toán học</h2>
       <p>{mode === 'mock' ? 'Mock Mode: nội dung fixture xác định, hoàn toàn offline.' : 'Live Gemini: chỉ gọi API sau xác nhận rõ ràng.'}</p>
       <label className="form-label">Lĩnh vực</label>
-      <select className="form-input" value="artificial_intelligence" disabled><option value="artificial_intelligence">Trí tuệ nhân tạo</option></select>
+      <select className="form-input" value={domain} onChange={(event) => {
+        const selected = event.target.value as typeof domain;
+        setDomain(selected);
+        setTopic(selected === 'mathematics' ? '7 hằng đẳng thức đáng nhớ' : 'Perceptron và nguyên lý hoạt động của mạng nơ-ron nhân tạo');
+      }}>
+        <option value="mathematics">Toán học</option>
+        <option value="artificial_intelligence">Trí tuệ nhân tạo / Học máy</option>
+      </select>
       <label className="form-label">Chủ đề</label>
       <textarea className="form-textarea" value={topic} onChange={(event) => setTopic(event.target.value)} />
+      <div aria-label="Ví dụ chương trình học">
+        {(domain === 'mathematics'
+          ? [['7 hằng đẳng thức đáng nhớ', true], ['Đạo hàm của x³', true], ['Định lý Bayes', false], ['Tích phân Riemann', true], ['Đại số tuyến tính', false]]
+          : [['Perceptron', true], ['Gradient Descent', true], ['Self-Attention', true], ['Neural Networks', false], ['Backpropagation', false]]
+        ).map(([example, ready]) => <button type="button" className="quick-chip" key={String(example)} onClick={() => setTopic(String(example))}>{example} · {ready ? 'render-ready' : 'planning-only'}</button>)}
+      </div>
+      <label><input type="checkbox" checked={subtitlesEnabled} onChange={(event) => setSubtitlesEnabled(event.target.checked)} /> Ghi phụ đề vào video và tạo SRT</label>
       <label className="form-label">Chế độ tạo nội dung</label>
       <select className="form-input" value={mode} onChange={(event) => setMode(event.target.value as 'mock' | 'live')}>
         <option value="mock">Mock offline (khuyến nghị demo)</option>
@@ -105,6 +170,45 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
       {mode === 'live' && <label><input type="checkbox" checked={confirmExternalApi} onChange={(event) => setConfirmExternalApi(event.target.checked)} /> Tôi cho phép gọi Gemini cho yêu cầu này.</label>}
       <button className="btn-generate" disabled={busy || (mode === 'live' && !confirmExternalApi)} onClick={generate}>Tạo bài học V3</button>
       {error && <p role="alert" className="error-message">{error}</p>}
+
+      {trace && (
+        <div className="job-panel" style={{ borderLeft: '3px solid var(--accent-cyan, #22d3ee)', marginTop: '14px' }} data-testid="v3-supervisor-trace">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <h3 style={{ margin: 0, color: 'var(--accent-cyan, #22d3ee)' }}>🤖 Điều phối Đa Agent (Educational Supervisor V3)</h3>
+            <span style={{ fontSize: '12px', padding: '2px 8px', borderRadius: '4px', background: 'rgba(34, 211, 238, 0.2)', color: '#22d3ee' }}>
+              {trace.elapsedMs}ms · {trace.tasks.length} Agent Tasks
+            </span>
+          </div>
+          <p style={{ fontSize: '13px', color: '#cbd5e1', marginTop: '6px' }}>{trace.humanReadableSummary}</p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '8px', marginTop: '10px' }}>
+            {trace.tasks.map((task) => (
+              <div
+                key={task.taskId}
+                style={{
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  background: 'rgba(15, 23, 42, 0.7)',
+                  border: task.status === 'completed' ? '1px solid rgba(74, 222, 128, 0.3)' : '1px solid rgba(248, 113, 113, 0.3)',
+                  fontSize: '12px'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                  <strong style={{ color: '#93c5fd' }}>{task.role}</strong>
+                  <span style={{ color: task.status === 'completed' ? '#4ade80' : '#f87171', fontWeight: 600 }}>
+                    {task.status === 'completed' ? '✓ Hoàn thành' : task.status}
+                  </span>
+                </div>
+                <div style={{ color: '#e2e8f0', fontSize: '11px' }}>{task.title}</div>
+                {task.durationMs !== undefined && (
+                  <div style={{ fontSize: '10px', color: '#64748b', marginTop: '4px' }}>
+                    {task.durationMs}ms · {task.validationStatus}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {draft && <div className="job-panel" data-testid="v3-draft">
         <p><strong>Nguồn tạo:</strong> {draft.lessonPlan.generationProvenance}</p>
@@ -148,6 +252,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
           <button className="quick-chip" disabled={busy || draft.status === 'approved'} onClick={save}>Lưu & tái kiểm định</button>
           <button className="quick-chip" disabled={busy || draft.status !== 'needs_review'} onClick={review}>Xác nhận rà soát ngữ nghĩa</button>
           <button className="btn-generate" disabled={busy || draft.status !== 'ready_for_approval' || draft.lessonPlan.capabilityReport.renderReadiness !== 'render_ready'} onClick={approve}>Duyệt & render MP4</button>
+          <button className="quick-chip" disabled={busy || draft.status !== 'approved' || !draft.approvedArtifact} onClick={retryEnqueue}>Xếp hàng lại bản đã duyệt</button>
         </div>
       </div>}
 

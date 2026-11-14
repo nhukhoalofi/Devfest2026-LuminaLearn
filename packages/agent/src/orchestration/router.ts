@@ -8,6 +8,7 @@ interface TopicRule {
   patterns: RegExp[];
   supportedTemplates: string[];
   requiredValidators: string[];
+  v3Only?: boolean;
 }
 
 const TOPIC_REGISTRY: TopicRule[] = [
@@ -50,6 +51,26 @@ const TOPIC_REGISTRY: TopicRule[] = [
     patterns: [/simpson/i, /nghịch lý simpson/i, /paradox/i, /dữ liệu gộp/i],
     supportedTemplates: ['dual_comparison', 'data_merge', 'concept_summary'],
     requiredValidators: ['simpson_rate_reversal']
+  },
+  {
+    topicId: 'algebra.identities.seven',
+    displayName: '7 hằng đẳng thức đáng nhớ',
+    domain: 'algebra',
+    patterns: [
+      /hằng đẳng thức/i,
+      /hang dang thuc/i,
+      /algebra.*identit/i,
+      /bình phương của một tổng/i,
+      /bình phương của một hiệu/i,
+      /hiệu hai bình phương/i,
+      /lập phương của một tổng/i,
+      /lập phương của một hiệu/i,
+      /tổng hai lập phương/i,
+      /hiệu hai lập phương/i
+    ],
+    supportedTemplates: ['algebra_identity', 'concept_summary'],
+    requiredValidators: ['algebra_identity_equivalence'],
+    v3Only: true
   }
 ];
 
@@ -59,6 +80,20 @@ export class TopicRouter {
 
     for (const rule of TOPIC_REGISTRY) {
       if (rule.patterns.some((pattern) => pattern.test(raw))) {
+        if (rule.v3Only) {
+          return {
+            topicId: rule.topicId,
+            displayName: rule.displayName,
+            domain: rule.domain,
+            confidence: 0.95,
+            supportedTemplates: [...rule.supportedTemplates],
+            requiredValidators: [...rule.requiredValidators],
+            isSupported: false,
+            v3Only: true,
+            unsupportedReason: `v2_unsupported_algebra_topic: Chủ đề '${rule.displayName}' (${rule.topicId}) chỉ được hỗ trợ kết xuất trên LuminaLearn V3 Multi-Topic Studio. Pipeline V2 chỉ hỗ trợ giải tích (đạo hàm và tích phân Riemann). Vui lòng sử dụng V3 Studio hoặc API /api/v3/lessons/draft.`
+          };
+        }
+
         return {
           topicId: rule.topicId,
           displayName: rule.displayName,

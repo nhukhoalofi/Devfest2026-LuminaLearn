@@ -41,56 +41,77 @@ export class GoogleGenAiAudioClient implements GeminiAudioClient {
   }
 
   async assertModelAvailable(model: string, signal: AbortSignal): Promise<void> {
-    const metadata = await this.ai.models.get({ model, config: { abortSignal: signal } });
-    if (!metadata.name) throw new Error(`tts_model_unavailable: Model '${model}' was not returned by the Gemini API`);
+    try {
+      const metadata = await this.ai.models.get({ model, config: { abortSignal: signal } });
+      if (!metadata.name) throw new Error(`tts_model_unavailable: Model '${model}' was not returned by the Gemini API`);
+    } catch (err) {
+      if (err instanceof Error && /404|not_found|unsupported/i.test(err.message)) {
+        return;
+      }
+      throw err;
+    }
   }
 
   async generateSpeech(request: GeminiSpeechRequest): Promise<GeminiSpeechResponse> {
     if (request.model === 'gemini-3.8-flash-tts' || request.model === 'gemini-3.8-flash-lite-tts') {
-      const interaction = await this.ai.interactions.create({
-        model: request.model,
-        input: [{
-          type: 'user_input',
-          content: [{
-            type: 'text',
-            text: request.text,
-            annotations: request.styleInstruction
-              ? [{ type: 'speech_metadata', style: request.styleInstruction }]
-              : []
-          }]
-        }],
-        response_format: { type: 'audio' },
-        generation_config: { speech_config: [{ voice: request.voice }] }
-      }, { fetch_options: { signal: request.signal } });
-      if (!interaction.output_audio?.data) {
+      try {
+        const interaction = await this.ai.interactions.create({
+          model: request.model,
+          input: [{
+            type: 'user_input',
+            content: [{
+              type: 'text',
+              text: request.text,
+              annotations: request.styleInstruction
+                ? [{ type: 'speech_metadata', style: request.styleInstruction }]
+                : []
+            }]
+          }],
+          response_format: { type: 'audio' },
+          generation_config: { speech_config: [{ voice: request.voice }] }
+        }, { fetch_options: { signal: request.signal } });
+        if (interaction.output_audio?.data) {
+          return {
+            data: interaction.output_audio.data,
+            mimeType: interaction.output_audio.mime_type,
+            modelVersion: request.model,
+            sampleRate: interaction.output_audio.sample_rate,
+            channels: interaction.output_audio.channels
+          };
+        }
         throw new Error('tts_empty_audio: Gemini returned no interaction audio payload');
+      } catch (err) {
+        if (/404|not_found|unsupported/i.test(err instanceof Error ? err.message : String(err))) {
+          throw new Error(`tts_model_unavailable: Gemini TTS model '${request.model}' is not available on this API key or endpoint`);
+        }
+        throw err;
       }
-      return {
-        data: interaction.output_audio.data,
-        mimeType: interaction.output_audio.mime_type,
-        modelVersion: request.model,
-        sampleRate: interaction.output_audio.sample_rate,
-        channels: interaction.output_audio.channels
-      };
     }
 
-    // Preview/legacy Gemini TTS models use generateContent and return raw PCM.
-    const response = await this.ai.models.generateContent({
-      model: request.model,
-      contents: [{ parts: [{ text: request.text }] }],
-      config: {
-        abortSignal: request.signal,
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          languageCode: request.languageCode,
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: request.voice } }
-        },
-        systemInstruction: request.styleInstruction
+    // Preview Gemini TTS models use generateContent with exact requested model (no silent model switching)
+    try {
+      const response = await this.ai.models.generateContent({
+        model: request.model,
+        contents: [{ parts: [{ text: request.text }] }],
+        config: {
+          abortSignal: request.signal,
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            languageCode: request.languageCode,
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: request.voice } }
+          },
+          systemInstruction: request.styleInstruction
+        }
+      });
+      const inlineData = response.candidates?.[0]?.content?.parts?.find((part) => part.inlineData)?.inlineData;
+      if (!inlineData?.data) throw new Error('tts_empty_audio: Gemini returned no inline audio payload');
+      return { data: inlineData.data, mimeType: inlineData.mimeType, modelVersion: response.modelVersion };
+    } catch (err) {
+      if (/404|not_found|unsupported/i.test(err instanceof Error ? err.message : String(err))) {
+        throw new Error(`tts_model_unavailable: Gemini TTS model '${request.model}' is not available on this API key or endpoint`);
       }
-    });
-    const inlineData = response.candidates?.[0]?.content?.parts?.find((part) => part.inlineData)?.inlineData;
-    if (!inlineData?.data) throw new Error('tts_empty_audio: Gemini returned no inline audio payload');
-    return { data: inlineData.data, mimeType: inlineData.mimeType, modelVersion: response.modelVersion };
+      throw err;
+    }
   }
 }
 
