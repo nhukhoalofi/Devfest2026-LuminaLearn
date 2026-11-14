@@ -56,6 +56,7 @@ export const EducationalClaimV3Schema = z.object({
   verificationStatus: EducationalVerificationStatusSchema,
   formalProofSummary: z.string().trim().max(500).optional(),
   sourceReferenceId: SafeIdString.optional(),
+  proofRecordId: SafeIdString.optional(),
   humanReviewComment: z.string().trim().max(500).optional(),
   formalExpressionVerified: z.boolean().optional(),
   statementSemanticStatus: StatementSemanticStatusSchema.optional(),
@@ -120,6 +121,8 @@ export const EducationalSceneTypeSchema = z.enum([
   'algebra_identity',
   'flowchart_simulation',
   'comparison_table',
+  'physics_optics',
+  'physics_explainer',
   'summary'
 ]);
 export type EducationalSceneType = z.infer<typeof EducationalSceneTypeSchema>;

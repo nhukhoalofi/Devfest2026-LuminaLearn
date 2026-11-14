@@ -6,7 +6,7 @@ import { detectDraftConflicts, type FieldConflict } from './conflict-utils';
 type UiState = 'idle' | 'ingesting' | 'drafting' | 'saving' | 'reviewing' | 'submitting' | 'generating' | 'completed' | 'failed';
 type InputMode = 'topic_prompt' | 'source_document';
 type RenderMode = 'mock' | 'live';
-type VoiceoverMode = 'none' | 'google_cloud_tts' | 'gemini_tts';
+type VoiceoverMode = 'none' | 'google_cloud_tts' | 'gemini_tts' | 'dutai_tts';
 type VisualStyleId = 'math_chalkboard' | 'clean_educational_infographic';
 
 interface JobStatus {
@@ -17,7 +17,7 @@ interface JobStatus {
   renderMode: RenderMode;
   error?: string;
   videoUrl?: string;
-  voiceoverMode: 'none' | 'provided_audio' | 'google_cloud_tts' | 'gemini_tts';
+  voiceoverMode: 'none' | 'provided_audio' | 'google_cloud_tts' | 'gemini_tts' | 'dutai_tts';
   subtitlesEnabled: boolean;
   failureType?: 'ai' | 'tts' | 'validation' | 'render' | 'interrupted';
 }
@@ -43,7 +43,7 @@ interface LessonDraftInfo {
     aspectRatio: '9:16' | '16:9' | '1:1';
     fps: number;
     renderMode: RenderMode;
-    narrationMode: 'none' | 'provided_audio' | 'google_cloud_tts' | 'gemini_tts';
+    narrationMode: 'none' | 'provided_audio' | 'google_cloud_tts' | 'gemini_tts' | 'dutai_tts';
     visualStyleId: VisualStyleId;
     subtitlesEnabled: boolean;
   };
@@ -108,6 +108,9 @@ function vietnameseApiError(payload: unknown, fallback: string): string {
   const code = typeof value?.error === 'string' ? value.error : value?.error?.code;
   const message = value?.message ?? (typeof value?.error === 'object' ? value.error.message : undefined);
   const classification = `${code ?? ''} ${message ?? ''}`.toLowerCase();
+  if (/gemini_transient_failed|service unavailable|temporarily unavailable|high demand|\b503\b|unavailable/.test(classification)) {
+    return 'Gemini đang quá tải tạm thời (HTTP 503). Không có dữ liệu nào bị mất; vui lòng chờ vài giây rồi bấm tạo bản thảo lại. Nếu lỗi lặp lại, hãy chuyển sang Mock offline để tiếp tục mà không gọi API.';
+  }
   if (/statement_requires_semantic_review|human semantic review|prose_unverified/.test(classification)) {
     return 'Các mệnh đề diễn giải tự do cần giáo viên xác nhận ngữ nghĩa. Vui lòng kiểm tra và tích chọn ô "Giáo viên xác nhận mệnh đề diễn giải tự do..." ở dưới danh sách mệnh đề trước khi duyệt.';
   }
@@ -156,10 +159,10 @@ export function CreateVideoForm({
   const [draftDirty, setDraftDirty] = useState(false);
 
   const [renderMode, setRenderMode] = useState<RenderMode>('mock');
-  const [voiceoverMode, setVoiceoverMode] = useState<VoiceoverMode>('none');
+  const [voiceoverMode, setVoiceoverMode] = useState<VoiceoverMode>('dutai_tts');
   const [visualStyleId, setVisualStyleId] = useState<VisualStyleId>('clean_educational_infographic');
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
-  const [confirmExternalApi, setConfirmExternalApi] = useState(false);
+  const [confirmExternalApi, setConfirmExternalApi] = useState(true);
   const [confirmSemanticReview, setConfirmSemanticReview] = useState(false);
   const [conflictInfo, setConflictInfo] = useState<{
     serverVersion: number;
@@ -195,7 +198,7 @@ export function CreateVideoForm({
   }, []);
 
   const requiresExternalApi =
-    renderMode === 'live' || voiceoverMode === 'gemini_tts' || voiceoverMode === 'google_cloud_tts';
+    renderMode === 'live' || voiceoverMode === 'gemini_tts' || voiceoverMode === 'google_cloud_tts' || voiceoverMode === 'dutai_tts';
 
   function syncControlsFromDraft(loaded: LessonDraftInfo): void {
     if (!loaded.renderConfig) return;
@@ -203,7 +206,8 @@ export function CreateVideoForm({
     if (
       loaded.renderConfig.narrationMode === 'none' ||
       loaded.renderConfig.narrationMode === 'gemini_tts' ||
-      loaded.renderConfig.narrationMode === 'google_cloud_tts'
+      loaded.renderConfig.narrationMode === 'google_cloud_tts' ||
+      loaded.renderConfig.narrationMode === 'dutai_tts'
     ) {
       setVoiceoverMode(loaded.renderConfig.narrationMode);
     }
@@ -306,6 +310,51 @@ export function CreateVideoForm({
         visualStyleId,
         subtitlesEnabled,
         confirmExternalApi,
+        aspectRatio: '9:16'
+      };
+
+      const res = await fetch('/api/lessons/draft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(vietnameseApiError(data, 'Tạo bản thảo bài học thất bại'));
+      }
+
+      setDraft(data);
+      window.localStorage.setItem('lumina:lastDraftId', data.draftId);
+      syncControlsFromDraft(data);
+      setDraftDirty(false);
+      if (data.stage === 'needs_review') {
+        setError(null);
+      }
+      setUiState('reviewing');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setUiState('failed');
+    }
+  }
+
+  async function handleFallbackToMock(): Promise<void> {
+    setRenderMode('mock');
+    setError(null);
+    setUiState('drafting');
+    try {
+      const payload = {
+        topic: topic.trim(),
+        inputMode,
+        sourceDocumentIds: ingestedDoc ? [ingestedDoc.documentId] : [],
+        audience: 'Học sinh phổ thông',
+        language: 'vi',
+        targetDurationSeconds: 40,
+        renderMode: 'mock' as const,
+        narrationMode: voiceoverMode === 'gemini_tts' ? 'none' : voiceoverMode,
+        visualStyleId,
+        subtitlesEnabled,
+        confirmExternalApi: false,
         aspectRatio: '9:16'
       };
 
@@ -651,6 +700,63 @@ export function CreateVideoForm({
           </div>
           <div className="quick-topics" style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <div>
+              <span className="quick-topics-label" style={{ fontWeight: 600, color: '#38BDF8' }}>🌈 Vật lý & Thiên văn học (Physics & Astronomy):</span>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '4px' }}>
+                <button
+                  type="button"
+                  className="quick-chip"
+                  disabled={busy}
+                  style={{ borderColor: '#F59E0B', backgroundColor: 'rgba(245, 158, 11, 0.15)', color: '#FDE047', fontWeight: 700 }}
+                  onClick={() => {
+                    setTopic('Vì sao mùa hè thì nóng, còn mùa đông lại lạnh? (Trục Trái Đất nghiêng 23.5°)');
+                    setVoiceoverMode('dutai_tts');
+                    setConfirmExternalApi(true);
+                  }}
+                >
+                  🌍 Demo Các Mùa: Mùa hè nóng, mùa đông lạnh 56s (DUTAI TTS Bảo Trang + BGM)
+                </button>
+                <button
+                  type="button"
+                  className="quick-chip"
+                  disabled={busy}
+                  style={{ borderColor: '#38BDF8', backgroundColor: 'rgba(56, 189, 248, 0.15)', color: '#F8FAFC', fontWeight: 700 }}
+                  onClick={() => {
+                    setTopic('Vì sao sau cơn mưa xuất hiện cầu vồng? (Lăng kính tí hon & Tán sắc 7 màu)');
+                    setVoiceoverMode('dutai_tts');
+                    setConfirmExternalApi(true);
+                  }}
+                >
+                  🔘 Demo Vòng Tròn: Cầu vồng sau cơn mưa 60s (DUTAI TTS Bảo Trang + BGM)
+                </button>
+                <button
+                  type="button"
+                  className="quick-chip"
+                  disabled={busy}
+                  style={{ borderColor: '#06B6D4', backgroundColor: 'rgba(6, 182, 212, 0.15)', color: '#F8FAFC', fontWeight: 700 }}
+                  onClick={() => {
+                    setTopic('Vì sao điện thoại nghe gọi được với nhau? (Sóng điện từ & Viễn thông)');
+                    setVoiceoverMode('dutai_tts');
+                    setConfirmExternalApi(true);
+                  }}
+                >
+                  📱 Demo Viễn Thông: Sóng điện thoại 89s (DUTAI TTS Bảo Trang + BGM)
+                </button>
+                <button
+                  type="button"
+                  className="quick-chip"
+                  disabled={busy}
+                  style={{ borderColor: '#10B981', backgroundColor: 'rgba(16, 185, 129, 0.15)', color: '#F8FAFC', fontWeight: 700 }}
+                  onClick={() => {
+                    setTopic('Vì sao ngoài lon nước lạnh xuất hiện giọt sương? (Nhiệt độ điểm sương)');
+                    setVoiceoverMode('dutai_tts');
+                    setConfirmExternalApi(true);
+                  }}
+                >
+                  ❄️ Demo Nhiệt Học: Lon nước đọng sương 64s (DUTAI TTS Bảo Trang + BGM)
+                </button>
+              </div>
+            </div>
+            <div>
               <span className="quick-topics-label" style={{ fontWeight: 600, color: 'var(--accent-cyan)' }}>📐 Toán học (Mathematics):</span>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '4px' }}>
                 <button
@@ -833,6 +939,23 @@ export function CreateVideoForm({
       <div className="form-group mode-group">
         <span className="form-label">Giọng đọc & Âm thanh</span>
         <div className="mode-options voiceover-options">
+          <label className={`mode-option ${voiceoverMode === 'dutai_tts' ? 'selected' : ''}`}>
+            <input
+              type="radio"
+              name="voiceoverMode"
+              checked={voiceoverMode === 'dutai_tts'}
+              disabled={busy}
+              onChange={() => {
+                setVoiceoverMode('dutai_tts');
+                setConfirmExternalApi(true);
+                if (draft) setDraftDirty(true);
+              }}
+            />
+            <span>
+              <strong>🌟 DUTAI ZeroTTS — Giọng Bảo Trang (Mặc định)</strong>
+              <small>Giọng đọc tự nhiên chuẩn tiếng Việt · Miễn phí vĩnh viễn, không cần API Key</small>
+            </span>
+          </label>
           <label className={`mode-option ${voiceoverMode === 'none' ? 'selected' : ''}`}>
             <input
               type="radio"
@@ -845,7 +968,7 @@ export function CreateVideoForm({
               }}
             />
             <span>
-              <strong>Không giọng đọc (Mặc định)</strong>
+              <strong>Không giọng đọc (Video câm)</strong>
               <small>Video im tiếng, phụ đề đồng bộ — 0 cuộc gọi TTS</small>
             </span>
           </label>
@@ -862,7 +985,7 @@ export function CreateVideoForm({
             />
             <span>
               <strong>Gemini TTS (Opt-in)</strong>
-              <small>{geminiTtsEnabled ? 'Giọng Kore tiếng Việt (tối đa 5 request/job)' : 'Chưa cấu hình GEMINI_API_KEY'}</small>
+              <small>{geminiTtsEnabled ? 'Giọng Kore tiếng Việt (tối đa 10 request/job)' : 'Chưa cấu hình GEMINI_API_KEY'}</small>
             </span>
           </label>
           <label className={`mode-option ${voiceoverMode === 'google_cloud_tts' ? 'selected' : ''} ${!googleTtsEnabled ? 'disabled' : ''}`}>
@@ -914,7 +1037,7 @@ export function CreateVideoForm({
           <strong style={{ color: '#fbbf24' }}>⚠️ Xác nhận sử dụng API ngoài & Ngân sách Quota (Free Tier Safety):</strong>
           <ul style={{ margin: '6px 0 8px 18px', color: 'var(--text-secondary)' }}>
             <li>Gemini Live Planning/Narration: <strong>{renderMode === 'live' ? 'BẬT (tối đa 4 request/job)' : 'TẮT (0 request)'}</strong></li>
-            <li>Tổng hợp giọng đọc TTS: <strong>{voiceoverMode === 'gemini_tts' ? 'Gemini TTS (tối đa 5 request/job)' : voiceoverMode === 'google_cloud_tts' ? 'Google Cloud TTS' : 'TẮT'}</strong></li>
+            <li>Tổng hợp giọng đọc TTS: <strong>{voiceoverMode === 'gemini_tts' ? 'Gemini TTS (tối đa 10 request/job)' : voiceoverMode === 'google_cloud_tts' ? 'Google Cloud TTS' : 'TẮT'}</strong></li>
             <li>Phong cách hình ảnh: <code>{visualStyleId}</code> | Phụ đề: <strong>{subtitlesEnabled ? 'BẬT' : 'TẮT'}</strong></li>
           </ul>
           <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
@@ -944,9 +1067,41 @@ export function CreateVideoForm({
       </div>
 
       {error ? (
-        <p className="error-message" role="alert" style={{ marginTop: '1rem' }}>
-          {error}
-        </p>
+        <div style={{ marginTop: '1rem' }}>
+          <p className="error-message" role="alert">
+            {error}
+          </p>
+          {(error.includes('503') || error.includes('quá tải') || error.includes('gemini_transient_failed') || error.includes('Gemini') || error.includes('High Demand') || error.includes('thất bại')) && (
+            <div style={{ display: 'flex', gap: '10px', marginTop: '10px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn-secondary"
+                style={{ padding: '8px 14px', fontSize: '13px', borderRadius: '8px' }}
+                disabled={busy}
+                onClick={handleCreateDraft}
+              >
+                🔄 Thử lại
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                style={{
+                  padding: '8px 14px',
+                  fontSize: '13px',
+                  borderRadius: '8px',
+                  backgroundColor: 'rgba(34, 211, 238, 0.15)',
+                  color: '#22d3ee',
+                  borderColor: 'rgba(34, 211, 238, 0.4)',
+                  fontWeight: 600
+                }}
+                disabled={busy}
+                onClick={handleFallbackToMock}
+              >
+                ⚙️ Chuyển sang Mock offline (Khuyến nghị)
+              </button>
+            </div>
+          )}
+        </div>
       ) : null}
 
       {/* Draft Review Card */}

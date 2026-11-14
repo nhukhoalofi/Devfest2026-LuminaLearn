@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ApprovedRenderArtifactV3Schema,
+  GeminiRequestBudget,
   verifyExternalApiConsentV3,
   type ApprovedRenderArtifactV3,
   type ExternalApiConsentRecordV3,
@@ -12,9 +13,11 @@ import {
 } from '@luminalearn/scene-schema';
 import { GoogleCloudTtsProvider, isTrustedOfflineTtsFixture, probeAudio, probeAudioSignal, type TtsProvider } from './audio';
 import { GeminiTtsProvider } from './gemini-tts';
+import { DutaiTtsProvider } from './dutai-tts';
 import { defaultSceneAudioSynchronizer } from './scene-audio-synchronizer';
 import type { SynchronizedStoryboardAudio } from './scene-audio-synchronizer';
 import { srtTimestamp } from './subtitles';
+import { createV3MediaQualityReport } from './v3-media-quality';
 
 export interface SubtitleCueV3 {
   cueId?: string;
@@ -22,6 +25,19 @@ export interface SubtitleCueV3 {
   text: string;
   startFrame: number;
   endFrame: number;
+}
+
+/** Presentation-only cleanup for a legacy formula-only subtitle. */
+export function normalizeViewerSubtitleTextV3(value: string): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  const isLegacyDerivativeLimit =
+    compact.startsWith("f'(x) = lim_{h") &&
+    compact.includes('(x+h)² - x²') &&
+    compact.includes('(2x + h)') &&
+    compact.endsWith('= 2x');
+  return isLegacyDerivativeLimit
+    ? 'Lấy giới hạn khi h tiến về 0, thương sai phân cho f phẩy của x bằng 2x.'
+    : compact;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -47,7 +63,7 @@ export function verifyV3ArtifactIntegrity(artifact: ApprovedRenderArtifactV3): b
 
 function execute(command: string, args: string[], cwd = repositoryRoot): Promise<void> {
   return new Promise((resolvePromise, reject) => {
-    execFile(command, args, { cwd, windowsHide: true, timeout: 10 * 60_000, maxBuffer: 8 * 1024 * 1024 },
+    execFile(command, args, { cwd, windowsHide: true, timeout: 20 * 60_000, maxBuffer: 8 * 1024 * 1024 },
       (error, stdout, stderr) => error
         ? reject(new Error(`v3_remotion_render_failed: ${stderr || stdout || error.message}`, { cause: error }))
         : resolvePromise());
@@ -83,12 +99,18 @@ export interface RenderPipelineV3Options {
 export interface TrustedProofContextV3 {
   artifactIntegrityVerified: true;
   approvedDraftVersion: number;
+  verifiedBindingFingerprints: readonly string[];
 }
 
 export function deriveTrustedProofContextV3(artifact: ApprovedRenderArtifactV3): TrustedProofContextV3 {
   return {
     artifactIntegrityVerified: true,
-    approvedDraftVersion: artifact.approvedVersion
+    approvedDraftVersion: artifact.approvedVersion,
+    verifiedBindingFingerprints: artifact.lessonPlan.storyboard?.scenes.flatMap(
+      (scene) => scene.visualDefinition?.trustedMathBindings.map(
+        (binding) => binding.normalizedExpressionFingerprint
+      ) ?? []
+    ) ?? []
   };
 }
 
@@ -132,6 +154,7 @@ export async function runRenderPipelineV3(
 
   // Audio handling
   let audioTrackPath: string | undefined;
+  let audioIsTrustedSilentFixture = false;
   if (artifact.request.narrationMode === 'provided_audio') {
     if (!options.providedAudioPath) {
       throw new Error('v3_audio_missing: providedAudioPath is required when narrationMode is provided_audio');
@@ -166,13 +189,19 @@ export async function runRenderPipelineV3(
       throw new Error('v3_audio_silent: provided audio is completely silent');
     }
     audioTrackPath = realAudioPath;
-  } else if (artifact.request.narrationMode === 'gemini_tts' || artifact.request.narrationMode === 'google_cloud_tts') {
+  } else if (
+    artifact.request.narrationMode === 'gemini_tts' ||
+    artifact.request.narrationMode === 'google_cloud_tts' ||
+    artifact.request.narrationMode === 'dutai_tts'
+  ) {
     options.onStage?.('synthesizing_audio');
     const isGemini = artifact.request.narrationMode === 'gemini_tts';
-    const providerId = isGemini ? 'gemini_tts' : 'google_cloud_tts';
+    const isDutai = artifact.request.narrationMode === 'dutai_tts';
+    const providerId = isGemini ? 'gemini_tts' : isDutai ? 'dutai_tts' : 'google_cloud_tts';
 
     const suppliedProvider = options.ttsProvider;
     const isOfflineFixture = isTrustedOfflineTtsFixture(suppliedProvider);
+    audioIsTrustedSilentFixture = isOfflineFixture && Boolean(suppliedProvider?.isSilentFixture);
     // Consent is mandatory for every real/custom external provider, including injected providers.
     if (!isOfflineFixture) {
       if (!options.consentRecord) {
@@ -192,9 +221,37 @@ export async function runRenderPipelineV3(
       }
     }
 
+    const configuredTtsBudget = Number.parseInt(process.env.GEMINI_TTS_MAX_REQUESTS_PER_JOB ?? '10', 10);
+    const enforcedTtsBudget = Number.isInteger(configuredTtsBudget) && configuredTtsBudget > 0
+      ? configuredTtsBudget
+      : 10;
+    const narratedSceneCount = approvedStoryboard.scenes.filter((scene) =>
+      Boolean(scene.narration?.vietnamese?.trim())
+    ).length;
+    if (isGemini && narratedSceneCount > enforcedTtsBudget) {
+      throw new Error(
+        `tts_request_budget_insufficient: Storyboard requires ${narratedSceneCount} Gemini TTS requests, ` +
+        `but this job is authorized for at most ${enforcedTtsBudget}. Choose a shorter lesson or another narration mode.`
+      );
+    }
     const provider: TtsProvider = suppliedProvider ?? (
-      isGemini ? new GeminiTtsProvider() : new GoogleCloudTtsProvider()
+      isGemini
+        ? new GeminiTtsProvider({
+            requestBudget: new GeminiRequestBudget({ maxTtsRequestsPerJob: enforcedTtsBudget })
+          })
+        : isDutai
+          ? new DutaiTtsProvider()
+          : new GoogleCloudTtsProvider()
     );
+    const configuredTtsIntervalMs = Number.parseInt(
+      process.env.GEMINI_TTS_MIN_REQUEST_INTERVAL_MS ?? '21000',
+      10
+    );
+    const geminiTtsIntervalMs = isDutai
+      ? 200
+      : Number.isInteger(configuredTtsIntervalMs) && configuredTtsIntervalMs >= 0
+        ? Math.min(configuredTtsIntervalMs, 60_000)
+        : 21_000;
 
     const syncResult = await defaultSceneAudioSynchronizer.synchronizeStoryboard(
       approvedStoryboard.scenes.map((s) => ({
@@ -204,7 +261,13 @@ export async function runRenderPipelineV3(
       })),
       {
         ttsProvider: provider,
+        voice: 'voice' in provider && typeof provider.voice === 'string' ? provider.voice : undefined,
+        language: 'languageCode' in provider && typeof provider.languageCode === 'string' ? provider.languageCode : undefined,
         fps: artifact.request.fps,
+        preRollSeconds: 0.25,
+        postRollSeconds: 0.35,
+        maxPostSpeechHoldSeconds: 0.25,
+        minProviderRequestIntervalMs: isGemini && !isOfflineFixture ? geminiTtsIntervalMs : 0,
         ownerId: artifact.ownerId,
         outputDir
       }
@@ -244,7 +307,7 @@ export async function runRenderPipelineV3(
       .filter((timing) => timing.speechEndFrame > timing.speechStartFrame)
       .map((timing, idx) => {
         const scene = approvedStoryboard.scenes.find((s) => s.sceneId === timing.sceneId);
-        const text = (scene?.narration?.subtitleVietnamese || scene?.narration?.vietnamese || timing.normalizedText || '').trim();
+        const text = normalizeViewerSubtitleTextV3(scene?.narration?.subtitleVietnamese || scene?.narration?.vietnamese || timing.normalizedText || '');
         return {
           cueId: `cue_${idx + 1}`,
           sceneId: timing.sceneId,
@@ -264,7 +327,7 @@ export async function runRenderPipelineV3(
       const startFrame = currentFrame;
       const endFrame = startFrame + durationFrames;
       currentFrame = endFrame;
-      const text = (scene.narration?.subtitleVietnamese || scene.narration?.vietnamese || '').trim();
+      const text = normalizeViewerSubtitleTextV3(scene.narration?.subtitleVietnamese || scene.narration?.vietnamese || '');
       return {
         cueId: `cue_${idx + 1}`,
         sceneId: scene.sceneId,
@@ -300,13 +363,15 @@ export async function runRenderPipelineV3(
   const workerDir = resolve(repositoryRoot, 'apps/worker');
   const command = process.execPath;
   const remotionTarget = audioTrackPath ? rawVideoPath : outputPath;
+  const compositionId = artifact.request.domain === 'physics' ? 'LuminaPhysicsSceneV3' : 'LuminaSceneV3';
   const args = [
     resolve(workerDir, 'node_modules/@remotion/cli/remotion-cli.js'), 'render',
-    'src/index.ts', 'LuminaSceneV3', remotionTarget,
+    'src/index.ts', compositionId, remotionTarget,
     '--props', propsPath,
+    '--concurrency', '2',
     '--codec', 'h264'
   ];
-  const chrome = process.env.REMOTION_BROWSER_EXECUTABLE;
+  const chrome = process.env.REMOTION_BROWSER_EXECUTABLE || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
   if (chrome) args.push('--browser-executable', chrome);
   await execute(command, args, workerDir);
 
@@ -314,36 +379,60 @@ export async function runRenderPipelineV3(
   if (audioTrackPath) {
     options.onStage?.('merging_media');
     const videoDuration = await probeVideoDuration(remotionTarget);
-    const audioMeta = await probeAudio(audioTrackPath, 600);
+    const audioMeta = await probeAudio(audioTrackPath, 1200);
 
-    // Checkpoint E: If audio exceeds video timeline by > 0.05s, FAIL CLOSED rather than truncating speech with FFmpeg -t
+    // Checkpoint E: If audio exceeds video timeline beyond codec packet tolerance, FAIL CLOSED rather than truncating speech with FFmpeg -t
     const durationDelta = audioMeta.durationSeconds - videoDuration;
-    if (durationDelta > 0.05) {
+    const maxAllowedDelta =
+      artifact.request.narrationMode === 'gemini_tts' || artifact.request.narrationMode === 'google_cloud_tts'
+        ? 0.25
+        : 0.05;
+    if (durationDelta > maxAllowedDelta) {
       throw new Error(`audio_duration_overflow: Narration speech duration (${audioMeta.durationSeconds.toFixed(2)}s) exceeds approved video timeline (${videoDuration.toFixed(2)}s) by ${durationDelta.toFixed(2)}s. Increase scene duration or shorten narration text.`);
     }
 
     // Pad audio with silence up to videoDuration so speech is never truncated and video is never shortened
-    const ffmpegArgs = [
-      '-y',
-      '-i', remotionTarget,
-      '-i', audioTrackPath,
-      '-map', '0:v:0',
-      '-map', '1:a:0',
-      '-c:v', 'copy',
-      '-c:a', 'aac',
-      '-b:a', '160k',
-      '-ar', '48000',
-      '-af', `apad=whole_dur=${videoDuration.toFixed(3)}`,
-      '-t', videoDuration.toFixed(3),
-      outputPath
-    ];
+    const ffmpegArgs = artifact.request.domain === 'physics'
+      ? [
+          '-y', '-i', remotionTarget, '-i', audioTrackPath,
+          '-filter_complex', `[0:a:0]volume=0.18[score];[1:a:0]apad=whole_dur=${videoDuration.toFixed(3)}[voice];[score][voice]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[mix]`,
+          '-map', '0:v:0', '-map', '[mix]',
+          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-ar', '48000',
+          '-t', videoDuration.toFixed(3), outputPath
+        ]
+      : [
+          '-y', '-i', remotionTarget, '-i', audioTrackPath,
+          '-map', '0:v:0', '-map', '1:a:0',
+          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-ar', '48000',
+          '-af', `apad=whole_dur=${videoDuration.toFixed(3)}`,
+          '-t', videoDuration.toFixed(3), outputPath
+        ];
     await execute('ffmpeg', ffmpegArgs);
 
     // Validate merged media with FFprobe
-    const finalAudioMeta = await probeAudio(outputPath, 600);
+    const finalAudioMeta = await probeAudio(outputPath, 1200);
     if (finalAudioMeta.codec !== 'aac') {
       throw new Error(`muxing_verification_failed: Expected AAC audio in output container, got ${finalAudioMeta.codec}`);
     }
+  }
+
+  await createV3MediaQualityReport({
+    videoPath: outputPath,
+    jobDirectory: outputDir,
+    storyboard: resolvedStoryboard,
+    expectedWidth: artifact.request.width,
+    expectedHeight: artifact.request.height,
+    expectedFps: artifact.request.fps,
+    narrationRequired: artifact.request.narrationMode !== 'none',
+    trustedSilentFixture: audioIsTrustedSilentFixture
+  });
+
+  // Tự động trích xuất frame đầu tiên (0.5s) làm ảnh bìa thumbnail chất lượng cao
+  try {
+    const thumbPath = resolve(outputDir, 'thumbnail.png');
+    await execute('ffmpeg', ['-y', '-ss', '0.5', '-i', outputPath, '-vframes', '1', '-q:v', '2', thumbPath]);
+  } catch {
+    // Non-blocking
   }
 
   return { outputPath };

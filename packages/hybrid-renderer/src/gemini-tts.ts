@@ -35,29 +35,85 @@ export interface GeminiAudioClient {
   generateSpeech(request: GeminiSpeechRequest): Promise<GeminiSpeechResponse>;
 }
 
+export interface GoogleGenAiAudioClientOptions {
+  fetchImpl?: typeof fetch;
+  interactionsEndpoint?: string;
+  modelsEndpoint?: string;
+}
+
 export class GoogleGenAiAudioClient implements GeminiAudioClient {
   private readonly ai: GoogleGenAI;
+  private readonly apiKey: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly interactionsEndpoint: string;
+  private readonly modelsEndpoint: string;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, options: GoogleGenAiAudioClientOptions = {}) {
+    this.apiKey = apiKey;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.interactionsEndpoint = options.interactionsEndpoint ?? 'https://generativelanguage.googleapis.com/v1beta/interactions';
+    this.modelsEndpoint = options.modelsEndpoint ?? 'https://generativelanguage.googleapis.com/v1beta/models';
     this.ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
   }
 
   async assertModelAvailable(model: string, signal: AbortSignal): Promise<void> {
+    if (model === 'gemini-3.8-flash-tts' || model === 'gemini-3.8-flash-lite-tts') {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(`${this.modelsEndpoint}/${encodeURIComponent(model)}`, {
+          method: 'GET',
+          headers: { 'x-goog-api-key': this.apiKey },
+          signal
+        });
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`tts_network_error: Gemini model lookup failed (${message})`, { cause: error });
+      }
+      const responseText = await response.text();
+      let payload: { name?: string; error?: { status?: string; message?: string } } = {};
+      try {
+        payload = responseText ? JSON.parse(responseText) as typeof payload : {};
+      } catch (error) {
+        throw Object.assign(new Error('tts_invalid_response: Gemini model lookup returned non-JSON data', { cause: error }), {
+          status: response.status
+        });
+      }
+      if (!response.ok || !payload.name) {
+        if (response.status === 404) {
+          throw Object.assign(
+            new Error(`tts_model_unavailable: Gemini TTS model '${model}' is not available on this API key or endpoint`),
+            { status: 404 }
+          );
+        }
+        throw Object.assign(
+          new Error(`Gemini HTTP ${response.status}${payload.error?.status ? ` ${payload.error.status}` : ''}: ${payload.error?.message ?? 'Model lookup failed'}`),
+          { status: response.status, code: payload.error?.status }
+        );
+      }
+      return;
+    }
     try {
       const metadata = await this.ai.models.get({ model, config: { abortSignal: signal } });
       if (!metadata.name) throw new Error(`tts_model_unavailable: Model '${model}' was not returned by the Gemini API`);
     } catch (err) {
       if (err instanceof Error && /404|not_found|unsupported/i.test(err.message)) {
-        return;
+        throw new Error(`tts_model_unavailable: Gemini TTS model '${model}' is not available on this API key or endpoint`);
       }
       throw err;
     }
   }
 
-  async generateSpeech(request: GeminiSpeechRequest): Promise<GeminiSpeechResponse> {
-    if (request.model === 'gemini-3.8-flash-tts' || request.model === 'gemini-3.8-flash-lite-tts') {
-      try {
-        const interaction = await this.ai.interactions.create({
+  private async generateInteractionSpeech(request: GeminiSpeechRequest): Promise<GeminiSpeechResponse> {
+    let response: Response;
+    try {
+      response = await this.fetchImpl(this.interactionsEndpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': this.apiKey
+        },
+        body: JSON.stringify({
           model: request.model,
           input: [{
             type: 'user_input',
@@ -71,17 +127,65 @@ export class GoogleGenAiAudioClient implements GeminiAudioClient {
           }],
           response_format: { type: 'audio' },
           generation_config: { speech_config: [{ voice: request.voice }] }
-        }, { fetch_options: { signal: request.signal } });
-        if (interaction.output_audio?.data) {
-          return {
-            data: interaction.output_audio.data,
-            mimeType: interaction.output_audio.mime_type,
-            modelVersion: request.model,
-            sampleRate: interaction.output_audio.sample_rate,
-            channels: interaction.output_audio.channels
-          };
-        }
-        throw new Error('tts_empty_audio: Gemini returned no interaction audio payload');
+        }),
+        signal: request.signal
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`tts_network_error: Gemini Interactions request failed (${message})`, { cause: error });
+    }
+
+    const responseText = await response.text();
+    let payload: unknown;
+    try {
+      payload = responseText ? JSON.parse(responseText) : {};
+    } catch (error) {
+      throw Object.assign(new Error('tts_invalid_response: Gemini Interactions returned non-JSON data', { cause: error }), {
+        status: response.status
+      });
+    }
+
+    if (!response.ok) {
+      const errorPayload = payload as { error?: { status?: string; message?: string; code?: number } };
+      const apiError = errorPayload.error;
+      throw Object.assign(
+        new Error(`Gemini HTTP ${response.status}${apiError?.status ? ` ${apiError.status}` : ''}: ${apiError?.message ?? 'Interactions request failed'}`),
+        { status: response.status, code: apiError?.status }
+      );
+    }
+
+    type AudioBlock = {
+      type?: string;
+      data?: string;
+      mime_type?: string;
+      sample_rate?: number;
+      channels?: number;
+    };
+    const interaction = payload as {
+      output_audio?: AudioBlock;
+      steps?: Array<{ content?: AudioBlock[] }>;
+      model_version?: string;
+    };
+    const stepAudio = interaction.steps
+      ?.flatMap((step) => step.content ?? [])
+      .filter((block) => block.type === 'audio' && typeof block.data === 'string')
+      .at(-1);
+    const audio = interaction.output_audio?.data ? interaction.output_audio : stepAudio;
+    if (!audio?.data) throw new Error('tts_empty_audio: Gemini returned no interaction audio payload');
+    return {
+      data: audio.data,
+      mimeType: audio.mime_type,
+      modelVersion: interaction.model_version ?? request.model,
+      sampleRate: audio.sample_rate,
+      channels: audio.channels
+    };
+  }
+
+  async generateSpeech(request: GeminiSpeechRequest): Promise<GeminiSpeechResponse> {
+    if (request.model === 'gemini-3.8-flash-tts' || request.model === 'gemini-3.8-flash-lite-tts') {
+      try {
+        return await this.generateInteractionSpeech(request);
       } catch (err) {
         if (/404|not_found|unsupported/i.test(err instanceof Error ? err.message : String(err))) {
           throw new Error(`tts_model_unavailable: Gemini TTS model '${request.model}' is not available on this API key or endpoint`);
@@ -141,6 +245,17 @@ const SUPPORTED_GEMINI_TTS_MODELS = new Set([
 
 export function isSupportedGeminiTtsModel(model: string): boolean {
   return SUPPORTED_GEMINI_TTS_MODELS.has(model);
+}
+
+/**
+ * Ensures Google Cloud TTS voice IDs (e.g. 'vi-VN-Neural2-A') are never sent to Gemini TTS speaker configs.
+ */
+export function resolveGeminiVoiceName(candidate: string | undefined, fallback = 'Kore'): string {
+  const trimmed = candidate?.trim();
+  if (!trimmed || /^[a-z]{2,3}-[A-Z]{2}-/i.test(trimmed)) {
+    return fallback;
+  }
+  return trimmed;
 }
 
 function runFfmpeg(args: string[], timeoutMs: number): Promise<void> {
@@ -213,7 +328,8 @@ export class GeminiTtsProvider implements TtsProvider {
     this.apiKey = options.apiKey ?? process.env.GEMINI_API_KEY;
     this.consentRecord = options.consentRecord;
     this.model = options.model ?? process.env.GEMINI_TTS_MODEL ?? 'gemini-3.8-flash-lite-tts';
-    this.voice = options.voice ?? process.env.GEMINI_TTS_VOICE ?? 'Kore';
+    const defaultEnvVoice = resolveGeminiVoiceName(process.env.GEMINI_TTS_VOICE, 'Kore');
+    this.voice = resolveGeminiVoiceName(options.voice, defaultEnvVoice);
     const configuredLanguage = options.language ?? process.env.GEMINI_TTS_LANGUAGE ?? 'vi';
     this.languageCode = configuredLanguage === 'vi' ? 'vi-VN' : configuredLanguage;
     this.timeoutMs = options.timeoutMs ?? 45_000;
@@ -266,15 +382,19 @@ export class GeminiTtsProvider implements TtsProvider {
       }
     }
 
-    try {
-      await this.ensureModelAvailable();
-    } catch (error) {
-      throw classifyGeminiError(error, this.apiKey);
-    }
-
     let response: GeminiSpeechResponse | undefined;
     let lastError: Error | undefined;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+      try {
+        await this.ensureModelAvailable();
+      } catch (error) {
+        if (attempt === this.maxAttempts) {
+          throw classifyGeminiError(error, this.apiKey);
+        }
+        this.modelAvailability = undefined;
+        await new Promise((r) => setTimeout(r, 1500 * attempt));
+        continue;
+      }
       let attemptId: number;
       try {
         attemptId = this.budget.consume('gemini_tts', this.model);
@@ -286,7 +406,7 @@ export class GeminiTtsProvider implements TtsProvider {
         response = await this.withTimeout((signal) => this.client.generateSpeech({
           model: this.model,
           text: narration,
-          voice: settings?.voice ?? this.voice,
+          voice: resolveGeminiVoiceName(settings?.voice, this.voice),
           languageCode: settings?.languageCode ?? this.languageCode,
           styleInstruction: 'Giọng giáo viên Việt Nam tự nhiên, rõ ràng, tốc độ vừa phải. Đọc nguyên văn nội dung.',
           signal

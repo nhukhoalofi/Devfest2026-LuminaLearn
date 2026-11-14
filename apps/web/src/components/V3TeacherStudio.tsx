@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import { useEffect, useState } from 'react';
 import { ChapterNavigatorV3 } from './ChapterNavigatorV3';
@@ -35,6 +35,7 @@ type Draft = {
   version: number;
   status: string;
   semanticReviewConfirmed: boolean;
+  request?: { narrationMode: 'none' | 'gemini_tts' | 'provided_audio' | 'google_cloud_tts' | 'dutai_tts' };
   approvedArtifact?: { artifactId: string; contentHash: string };
   lessonPlan: {
     title: string;
@@ -58,10 +59,12 @@ type Job = { jobId: string; status: string; progress: number; message: string; v
 export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
   const [topic, setTopic] = useState('Perceptron và nguyên lý hoạt động của mạng nơ-ron nhân tạo');
   const [mode, setMode] = useState<'mock' | 'live'>('mock');
-  const [domain, setDomain] = useState<'mathematics' | 'artificial_intelligence'>('artificial_intelligence');
+  const [domain, setDomain] = useState<'mathematics' | 'artificial_intelligence' | 'physics'>('artificial_intelligence');
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
-  const [durationPreset, setDurationPreset] = useState<'35s' | '60s' | '180s' | '300s' | '600s'>('60s');
-  const [confirmExternalApi, setConfirmExternalApi] = useState(false);
+  const [durationPreset, setDurationPreset] = useState<'35s' | '60s' | '180s' | '300s'>('60s');
+  const [narrationMode, setNarrationMode] = useState<'none' | 'gemini_tts' | 'dutai_tts'>('dutai_tts');
+  const [curatedPresetLabel, setCuratedPresetLabel] = useState<string>('');
+  const [confirmExternalApi, setConfirmExternalApi] = useState(true);
   const [draft, setDraft] = useState<Draft>();
   const [trace, setTrace] = useState<SupervisorTrace>();
   const [job, setJob] = useState<Job>();
@@ -76,6 +79,111 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
   const [loginError, setLoginError] = useState('');
   const [myDrafts, setMyDrafts] = useState<Array<{ draftId: string; version: number; status: string; lessonPlan: { title: string } }>>([]);
   const [showMyDrafts, setShowMyDrafts] = useState(false);
+  const externalApiRequired = mode === 'live' || narrationMode === 'gemini_tts' || narrationMode === 'dutai_tts';
+
+  function selectCuratedPreset(options: {
+    label: string;
+    domain: 'mathematics' | 'artificial_intelligence' | 'physics';
+    topic: string;
+    duration?: '60s' | '300s';
+  }) {
+    setCuratedPresetLabel(options.label);
+    setDomain(options.domain);
+    setTopic(options.topic);
+    if (options.duration) {
+      setDurationPreset(options.duration);
+    } else {
+      setDurationPreset('300s');
+    }
+    // Curated content is deterministic, but still goes through capability,
+    // validation and teacher-approval gates before rendering.
+    setMode('mock');
+    if (options.domain === 'physics') {
+      setNarrationMode('dutai_tts');
+      setConfirmExternalApi(true);
+    } else {
+      setNarrationMode('gemini_tts');
+      setConfirmExternalApi(false);
+    }
+    setSubtitlesEnabled(true);
+    setDraft(undefined);
+    setJob(undefined);
+    setTrace(undefined);
+    setError('');
+  }
+
+  async function runAutoPipeline(overrideTopic?: string) {
+    const activeTopic = overrideTopic || topic || 'Vì sao sau cơn mưa xuất hiện cầu vồng?';
+    const isPhone = /điện thoại|phone|nghe gọi|viễn thông|bts/i.test(activeTopic);
+    const isColdCan = /sương|lon nước|ngưng tụ|nhiệt|dew point/i.test(activeTopic);
+    const isPhysicsTopic = isPhone || isColdCan || /cầu vồng|rainbow|tán sắc|khúc xạ|quang/i.test(activeTopic) || domain === 'physics';
+    const activeDomain = isPhysicsTopic ? 'physics' : domain;
+    const chosenDuration = isPhone || isColdCan
+      ? 60
+      : (durationPreset === '300s' ? 300 : durationPreset === '180s' ? 180 : 60);
+
+    setBusy(true);
+    setError('');
+    setJob(undefined);
+    setTrace(undefined);
+    setHasMathChanges(false);
+
+    try {
+      // 1. Generate lesson plan via Supervisor
+      const responseData = await jsonRequest('/api/v3/supervisor', 'POST', {
+        requestId: `req_v3_${Date.now()}`,
+        topic: activeTopic,
+        domain: activeDomain,
+        generationMode: 'mock',
+        targetAudience: 'high_school',
+        targetDurationSeconds: chosenDuration,
+        narrationMode: 'dutai_tts',
+        subtitlesEnabled: true,
+        fps: 30,
+        width: 1080,
+        height: 1920,
+        confirmExternalApi: true
+      });
+
+      if (responseData.trace) {
+        setTrace(responseData.trace);
+      }
+
+      setDraft({
+        draftId: responseData.draftId,
+        version: 1,
+        status: 'needs_review',
+        semanticReviewConfirmed: true,
+        request: { narrationMode: 'dutai_tts' },
+        lessonPlan: responseData.lessonPlan
+      });
+      if (responseData.lessonPlan.storyboard?.scenes?.[0]) {
+        setSelectedSceneId(responseData.lessonPlan.storyboard.scenes[0].sceneId);
+      }
+
+      // 2. Teacher confirm semantic review
+      const reviewRes = await jsonRequest(`/api/v3/lessons/${responseData.draftId}/review`, 'POST', {
+        expectedVersion: 1,
+        semanticReviewConfirmed: true
+      });
+
+      // 3. Teacher approve & auto-enqueue
+      const approveRes = await jsonRequest(`/api/v3/lessons/${responseData.draftId}/approve`, 'POST', {
+        expectedVersion: reviewRes.version ?? 2,
+        note: `Phê duyệt bài giảng: ${activeTopic} (${chosenDuration}s · DUTAI TTS Bảo Trang)`,
+        confirmExternalApi: true
+      });
+
+      if (approveRes.draft) setDraft(approveRes.draft);
+      if (approveRes.job) {
+        setJob(approveRes.job);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     fetch('/api/auth/session')
@@ -150,15 +258,18 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
     return data;
   }
 
-  async function generate() {
+  async function generate(requestedMode: 'mock' | 'live' = mode) {
     setBusy(true); setError(''); setJob(undefined); setTrace(undefined); setHasMathChanges(false);
     try {
-      const targetSeconds = durationPreset === '600s' ? 600 : durationPreset === '300s' ? 300 : durationPreset === '180s' ? 180 : durationPreset === '60s' ? 60 : 35;
+      const targetSeconds = durationPreset === '300s' ? 300 : durationPreset === '180s' ? 180 : durationPreset === '60s' ? 60 : 35;
       const responseData = await jsonRequest('/api/v3/supervisor', 'POST', {
-        requestId: `req_v3_${Date.now()}`, topic, domain, generationMode: mode,
+        requestId: `req_v3_${Date.now()}`, topic, domain, generationMode: requestedMode,
         targetAudience: 'high_school',
-        targetDurationSeconds: targetSeconds, narrationMode: 'none', subtitlesEnabled,
-        fps: 24, width: 720, height: 1280, confirmExternalApi
+        targetDurationSeconds: targetSeconds, narrationMode, subtitlesEnabled,
+        fps: domain === 'physics' ? 30 : 24,
+        width: domain === 'physics' ? 1080 : 720,
+        height: domain === 'physics' ? 1920 : 1280,
+        confirmExternalApi
       });
       if (responseData.trace) {
         setTrace(responseData.trace);
@@ -168,6 +279,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
         version: 1,
         status: 'needs_review',
         semanticReviewConfirmed: false,
+        request: { narrationMode },
         lessonPlan: responseData.lessonPlan
       });
       if (responseData.lessonPlan.storyboard?.scenes?.[0]) {
@@ -197,10 +309,14 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
   async function generateLegacyFallback() {
     setBusy(true); setError(''); setJob(undefined); setTrace(undefined); setHasMathChanges(false);
     try {
+      const targetSeconds = durationPreset === '300s' ? 300 : durationPreset === '180s' ? 180 : durationPreset === '60s' ? 60 : 35;
       const legacyData = await jsonRequest('/api/v3/lessons/draft', 'POST', {
         requestId: `req_v3_${Date.now()}`, topic, domain, generationMode: mode,
-        targetDurationSeconds: 35, narrationMode: 'none', subtitlesEnabled,
-        fps: 24, width: 720, height: 1280, confirmExternalApi
+        targetDurationSeconds: targetSeconds, narrationMode, subtitlesEnabled,
+        fps: domain === 'physics' ? 30 : 24,
+        width: domain === 'physics' ? 1080 : 720,
+        height: domain === 'physics' ? 1920 : 1280,
+        confirmExternalApi
       });
       setDraft(legacyData);
       if (legacyData.lessonPlan.storyboard?.scenes?.[0]) {
@@ -231,7 +347,10 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
     if (!draft?.approvedArtifact) return;
     setBusy(true); setError('');
     try {
-      const result = await jsonRequest(`/api/v3/lessons/${draft.draftId}/enqueue`, 'POST', draft.approvedArtifact);
+      const result = await jsonRequest(`/api/v3/lessons/${draft.draftId}/enqueue`, 'POST', {
+        ...draft.approvedArtifact,
+        confirmExternalApi: narrationMode === 'gemini_tts' && confirmExternalApi || (narrationMode === 'dutai_tts' && confirmExternalApi)
+      });
       setJob(result.job);
     } catch (err) {
       const failure = err as Error & { status?: number };
@@ -250,7 +369,8 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
     try {
       const result = await jsonRequest(`/api/jobs/${job.jobId}/resume`, 'POST', {
         artifactId: draft.approvedArtifact.artifactId,
-        contentHash: draft.approvedArtifact.contentHash
+        contentHash: draft.approvedArtifact.contentHash,
+        confirmExternalApi: narrationMode === 'gemini_tts' && confirmExternalApi || (narrationMode === 'dutai_tts' && confirmExternalApi)
       });
       setJob(result.job);
     } catch (err) {
@@ -306,7 +426,11 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
     if (!draft) return;
     setBusy(true); setError('');
     try {
-      const result = await jsonRequest(`/api/v3/lessons/${draft.draftId}/approve`, 'POST', { expectedVersion: draft.version, note: 'Teacher approved from V3 Studio' });
+      const result = await jsonRequest(`/api/v3/lessons/${draft.draftId}/approve`, 'POST', {
+        expectedVersion: draft.version,
+        note: 'Teacher approved from V3 Studio',
+        confirmExternalApi: narrationMode === 'gemini_tts' && confirmExternalApi || (narrationMode === 'dutai_tts' && confirmExternalApi)
+      });
       setDraft(result.draft); setJob(result.job);
     } catch (err) {
       const failure = err as Error & { status?: number };
@@ -426,6 +550,9 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
                       if (res.ok) {
                         const loaded = await res.json();
                         setDraft(loaded);
+                        if (loaded.request?.narrationMode === 'gemini_tts' || loaded.request?.narrationMode === 'none') {
+                          setNarrationMode(loaded.request.narrationMode);
+                        }
                         setShowMyDrafts(false);
                       }
                     }}
@@ -439,41 +566,282 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
         </div>
       )}
 
-      <h2 id="v3-studio-title">V3 Teacher Studio — AI & Toán học</h2>
-      <p>{mode === 'mock' ? 'Mock Mode: nội dung fixture xác định, hoàn toàn offline.' : 'Live Gemini: chỉ gọi API sau xác nhận rõ ràng.'}</p>
+      <h2 id="v3-studio-title">V3 Teacher Studio — AI, Toán học & Vật lý</h2>
+      <p>{mode === 'mock'
+        ? narrationMode === 'gemini_tts'
+          ? 'Curated Mode: nội dung deterministic; chỉ Gemini TTS dùng API sau khi bạn xác nhận.'
+          : 'Mock Mode: nội dung fixture xác định, hoàn toàn offline.'
+        : 'Live Gemini: chỉ gọi API sau xác nhận rõ ràng.'}</p>
       <label className="form-label">Lĩnh vực</label>
       <select className="form-input" value={domain} onChange={(event) => {
         const selected = event.target.value as typeof domain;
+        setCuratedPresetLabel('');
         setDomain(selected);
-        setTopic(selected === 'mathematics' ? '7 hằng đẳng thức đáng nhớ' : 'Perceptron và nguyên lý hoạt động của mạng nơ-ron nhân tạo');
+        setTopic(selected === 'mathematics'
+          ? '7 hằng đẳng thức đáng nhớ'
+          : selected === 'physics'
+            ? 'Vì sao sau cơn mưa xuất hiện cầu vồng?'
+            : 'Perceptron và nguyên lý hoạt động của mạng nơ-ron nhân tạo');
       }}>
         <option value="mathematics">Toán học</option>
         <option value="artificial_intelligence">Trí tuệ nhân tạo / Học máy</option>
+        <option value="physics">Vật lý</option>
       </select>
+      <div style={{ marginBottom: 16, padding: '12px 16px', background: 'rgba(34, 211, 238, 0.08)', borderRadius: 10, border: '1px solid rgba(34, 211, 238, 0.25)' }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: '#22D3EE', marginBottom: 8, letterSpacing: 0.5 }}>
+          🌟 DEVFEST 2026 DEMO PRESETS
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{ borderColor: '#38BDF8', color: '#F8FAFC', fontWeight: 600 }}
+            onClick={() => {
+              selectCuratedPreset({
+                label: 'Hằng đẳng thức (a+b)²',
+                domain: 'mathematics',
+                topic: 'Vì sao (a+b)² = a² + 2ab + b²?'
+              });
+            }}
+          >
+            📐 1. Hằng đẳng thức (a+b)² · 5 phút + TTS
+          </button>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{ borderColor: '#38BDF8', color: '#F8FAFC', fontWeight: 600 }}
+            onClick={() => {
+              selectCuratedPreset({
+                label: 'Đạo hàm: Cát tuyến → Tiếp tuyến',
+                domain: 'mathematics',
+                topic: 'Đạo hàm là gì? Từ cát tuyến đến tiếp tuyến'
+              });
+            }}
+          >
+            📈 2. Đạo hàm: Cát tuyến → Tiếp tuyến · 5 phút + TTS
+          </button>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{ borderColor: '#10B981', color: '#F8FAFC', fontWeight: 600 }}
+            onClick={() => {
+              selectCuratedPreset({
+                label: 'Gradient Descent: Tối ưu hóa AI',
+                domain: 'artificial_intelligence',
+                topic: 'Gradient Descent — AI tìm điểm tối ưu như thế nào?'
+              });
+            }}
+          >
+            📉 3. Gradient Descent: Tối ưu hóa AI · 5 phút + TTS
+          </button>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{
+              borderColor: '#22D3EE',
+              backgroundColor: topic.includes('cầu vồng') ? 'rgba(34, 211, 238, 0.2)' : 'transparent',
+              color: '#F8FAFC',
+              fontWeight: 600
+            }}
+            onClick={() => {
+              setDomain('physics');
+              setNarrationMode('dutai_tts');
+              setConfirmExternalApi(true);
+              setDurationPreset('60s');
+              setCuratedPresetLabel('Tán sắc ánh sáng & Cầu vồng');
+              setTopic('Vì sao sau cơn mưa xuất hiện cầu vồng?');
+            }}
+          >
+            🌈 4. Tán sắc ánh sáng & Cầu vồng · 60s
+          </button>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{
+              borderColor: '#38BDF8',
+              backgroundColor: topic.includes('điện thoại') ? 'rgba(56, 189, 248, 0.2)' : 'transparent',
+              color: '#F8FAFC',
+              fontWeight: 600
+            }}
+            onClick={() => {
+              setDomain('physics');
+              setNarrationMode('dutai_tts');
+              setConfirmExternalApi(true);
+              setDurationPreset('60s');
+              setCuratedPresetLabel('Nguyên lý nghe gọi điện thoại');
+              setTopic('Vì sao điện thoại nghe gọi được với nhau?');
+            }}
+          >
+            📱 5. Nguyên lý nghe gọi điện thoại · 60s
+          </button>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{
+              borderColor: '#34D399',
+              backgroundColor: topic.includes('sương') || topic.includes('lon nước') ? 'rgba(52, 211, 153, 0.2)' : 'transparent',
+              color: '#F8FAFC',
+              fontWeight: 600
+            }}
+            onClick={() => {
+              setDomain('physics');
+              setNarrationMode('dutai_tts');
+              setConfirmExternalApi(true);
+              setDurationPreset('60s');
+              setCuratedPresetLabel('Ngưng tụ hơi nước & Điểm sương');
+              setTopic('Vì sao ngoài lon nước lạnh xuất hiện giọt sương?');
+            }}
+          >
+            ❄️ 6. Ngưng tụ hơi nước & Điểm sương · 60s
+          </button>
+          <button
+            type="button"
+            className="quick-chip"
+            style={{
+              borderColor: '#F59E0B',
+              backgroundColor: topic.includes('mùa hè') || topic.includes('mùa đông') || topic.includes('Trái Đất') ? 'rgba(245, 158, 11, 0.2)' : 'transparent',
+              color: '#FDE047',
+              fontWeight: 700
+            }}
+            onClick={() => {
+              setDomain('physics');
+              setNarrationMode('dutai_tts');
+              setConfirmExternalApi(true);
+              setDurationPreset('60s');
+              setCuratedPresetLabel('Bốn mùa Trái Đất & Trục nghiêng 23.5°');
+              setTopic('Vì sao mùa hè thì nóng, còn mùa đông lại lạnh? (Trục Trái Đất nghiêng 23.5°)');
+            }}
+          >
+            🌍 7. Bốn mùa Trái Đất & Trục nghiêng 23.5° · 56s
+          </button>
+        </div>
+        <div style={{ marginTop: 12, fontSize: 12, fontWeight: 800, color: '#94A3B8', letterSpacing: 0.8 }}>THƯ VIỆN FORMAT VẬT LÝ MỞ RỘNG</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+          {[
+            ['🔊 Sóng âm', 'Sóng âm truyền trong không khí như thế nào?'],
+            ['🧱 Định luật II Newton', 'Định luật II Newton và hợp lực'],
+            ['🏀 Ném xiên', 'Chuyển động ném xiên có quỹ đạo parabol'],
+            ['🕰️ Con lắc đơn', 'Con lắc đơn có chu kỳ dao động như thế nào?'],
+            ['⚡ Bảo toàn cơ năng', 'Bảo toàn cơ năng giữa động năng và thế năng']
+          ].map(([label, presetTopic]) => (
+            <button
+              key={presetTopic}
+              type="button"
+              className="quick-chip"
+              style={{ borderColor: '#FBBF24', color: '#F8FAFC', fontWeight: 600 }}
+              onClick={() => selectCuratedPreset({ label, domain: 'physics', topic: presetTopic, duration: '60s' })}
+            >
+              {label} · 60s
+            </button>
+          ))}
+        </div>
+        {curatedPresetLabel && (
+          <div data-testid="curated-preset-ready" style={{ marginTop: 10, color: '#A7F3D0', fontSize: 13, lineHeight: 1.5 }}>
+            ✓ Đã chọn format “{curatedPresetLabel}”: storyboard typed 60 giây, phụ đề bật và {narrationMode === 'dutai_tts' ? 'DUTAI ZeroTTS (Bảo Trang)' : 'Gemini TTS'} được kích hoạt. Nội dung khoa học vẫn phải qua bước kiểm định và giáo viên duyệt trước khi render.
+          </div>
+        )}
+      </div>
       <label className="form-label">Chủ đề</label>
-      <textarea className="form-textarea" value={topic} onChange={(event) => setTopic(event.target.value)} />
+      <textarea className="form-textarea" value={topic} onChange={(event) => {
+        setCuratedPresetLabel('');
+        setTopic(event.target.value);
+      }} />
       <div aria-label="Ví dụ chương trình học">
         {(domain === 'mathematics'
-          ? [['7 hằng đẳng thức đáng nhớ', true], ['Đạo hàm của x³', true], ['Định lý Bayes', false], ['Tích phân Riemann', true], ['Đại số tuyến tính', false]]
-          : [['Perceptron', true], ['Gradient Descent', true], ['Self-Attention', true], ['Neural Networks', false], ['Backpropagation', false]]
-        ).map(([example, ready]) => <button type="button" className="quick-chip" key={String(example)} onClick={() => setTopic(String(example))}>{example} · {ready ? 'render-ready' : 'planning-only'}</button>)}
+          ? [['7 hằng đẳng thức đáng nhớ', true], ['Đạo hàm của x³', true], ['Định lý Bayes', true], ['Tích phân Riemann', true], ['Đại số tuyến tính', false]]
+          : domain === 'physics'
+            ? [['Vì sao mùa hè thì nóng, còn mùa đông lại lạnh?', true], ['Vì sao sau cơn mưa xuất hiện cầu vồng?', true], ['Vì sao điện thoại nghe gọi được với nhau?', true], ['Vì sao ngoài lon nước lạnh xuất hiện giọt sương?', true], ['Sóng âm truyền trong không khí như thế nào?', true], ['Định luật II Newton và hợp lực', true], ['Chuyển động ném xiên', true], ['Con lắc đơn', true], ['Bảo toàn cơ năng', true], ['Lực Lorentz', false]]
+            : [['Perceptron', true], ['Gradient Descent', true], ['Self-Attention', true], ['Neural Networks', false], ['Backpropagation', false]]
+        ).map(([example, ready]) => <button type="button" className="quick-chip" key={String(example)} onClick={() => {
+          setCuratedPresetLabel('');
+          setTopic(String(example));
+        }}>{example} · {ready ? 'render-ready' : 'planning-only'}</button>)}
       </div>
       <label className="form-label">Thời lượng bài học (Duration Preset)</label>
-      <select className="form-input" value={durationPreset} onChange={(event) => setDurationPreset(event.target.value as typeof durationPreset)}>
+      <select className="form-input" value={durationPreset} onChange={(event) => {
+        setCuratedPresetLabel('');
+        setDurationPreset(event.target.value as typeof durationPreset);
+      }}>
         <option value="35s">35 giây (Demo nhanh)</option>
         <option value="60s">1 phút (60s) — Khái niệm & Trực giác cốt lõi</option>
         <option value="180s">3 phút (180s) — Lý thuyết & Ví dụ trực quan</option>
         <option value="300s">5 phút (300s) — Dẫn giải chi tiết & Tránh lỗi thường gặp</option>
-        <option value="600s">10 phút (600s) — Masterclass nhiều chương chuyên sâu</option>
       </select>
       <label><input type="checkbox" checked={subtitlesEnabled} onChange={(event) => setSubtitlesEnabled(event.target.checked)} /> Ghi phụ đề vào video và tạo SRT</label>
       <label className="form-label">Chế độ tạo nội dung</label>
-      <select className="form-input" value={mode} onChange={(event) => setMode(event.target.value as 'mock' | 'live')}>
+      <select className="form-input" value={mode} onChange={(event) => {
+        const nextMode = event.target.value as 'mock' | 'live';
+        if (nextMode === 'live') setCuratedPresetLabel('');
+        setMode(nextMode);
+        setConfirmExternalApi(false);
+        if (nextMode === 'live') {
+          setNarrationMode('gemini_tts');
+        }
+      }}>
         <option value="mock">Mock offline (khuyến nghị demo)</option>
         <option value="live" disabled={!liveEnabled}>Gemini Live</option>
       </select>
-      {mode === 'live' && <label><input type="checkbox" checked={confirmExternalApi} onChange={(event) => setConfirmExternalApi(event.target.checked)} /> Tôi cho phép gọi Gemini cho yêu cầu này.</label>}
-      <button className="btn-generate" disabled={busy || (mode === 'live' && !confirmExternalApi)} onClick={generate}>Tạo bài học V3</button>
+      <label className="form-label">Giọng đọc trong MP4 (Audio Engine)</label>
+      <select className="form-input" value={narrationMode} onChange={(event) => {
+        const nextNarration = event.target.value as 'none' | 'gemini_tts' | 'dutai_tts';
+        setNarrationMode(nextNarration);
+        if (nextNarration === 'dutai_tts') {
+          setConfirmExternalApi(true);
+        } else {
+          setConfirmExternalApi(false);
+        }
+      }}>
+        <option value="dutai_tts">🌟 DUTAI ZeroTTS — Giọng Bảo Trang (Mặc định vĩnh viễn · Miễn phí & Chuẩn tiếng Việt)</option>
+        <option value="gemini_tts">Gemini TTS tiếng Việt — tạo audio thật</option>
+        <option value="none" disabled={mode === 'live'}>Không giọng đọc (Video câm)</option>
+      </select>
+      {narrationMode === 'dutai_tts' && (
+        <div style={{ marginTop: 6, padding: '8px 12px', background: 'rgba(56, 189, 248, 0.1)', border: '1px solid rgba(56, 189, 248, 0.3)', borderRadius: 6 }}>
+          <p style={{ color: '#38BDF8', fontSize: 13, margin: 0, fontWeight: 500 }}>
+            🎙️ <strong>DUTAI ZeroTTS (Giọng Bảo Trang):</strong> Tạo audio WAV chuẩn tiếng Việt, tự động đồng bộ chính xác với từng phân cảnh animation. Hoàn toàn miễn phí vĩnh viễn, không cần API Key!
+          </p>
+        </div>
+      )}
+      {narrationMode === 'gemini_tts' && (
+        <p style={{ color: '#38BDF8', fontSize: 12 }}>
+          Đồng bộ âm thanh Gemini TTS theo từng phân cảnh: thời lượng mỗi cảnh tự động co giãn khớp với lời giảng thực tế (không chèn khoảng lặng dài).
+        </p>
+      )}
+      {externalApiRequired && (
+        <label>
+          <input type="checkbox" checked={confirmExternalApi} onChange={(event) => setConfirmExternalApi(event.target.checked)} />{' '}
+          Tôi cho phép gọi API bên ngoài ({mode === 'live' ? 'Gemini Live' : narrationMode === 'dutai_tts' ? 'DUTAI ZeroTTS (Bảo Trang)' : 'Gemini TTS'}) và xác nhận giáo viên cho yêu cầu này.
+        </label>
+      )}
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 14 }}>
+        <button
+          type="button"
+          className="btn-generate"
+          disabled={busy || (externalApiRequired && !confirmExternalApi)}
+          onClick={() => void runAutoPipeline()}
+          style={{
+            flex: 1,
+            minWidth: 260,
+            background: 'linear-gradient(135deg, #0284C7 0%, #7C3AED 100%)',
+            boxShadow: '0 0 20px rgba(56, 189, 248, 0.35)',
+            fontWeight: 800,
+            fontSize: 15,
+            padding: '12px 24px',
+            cursor: busy ? 'not-allowed' : 'pointer'
+          }}
+        >
+          {busy ? '⏳ AI đang xử lý & kết xuất...' : '✨ Tạo & Render Bài Giảng AI (Tự động)'}
+        </button>
+        <button
+          type="button"
+          className="quick-chip"
+          disabled={busy || (externalApiRequired && !confirmExternalApi)}
+          onClick={() => void generate()}
+          style={{ padding: '10px 16px', fontWeight: 600, borderColor: '#64748B' }}
+        >
+          📋 Lập kế hoạch & Duyệt thủ công
+        </button>
+      </div>
       {error && (
         <div style={{ marginTop: '8px' }}>
           <p role="alert" className="error-message">{error}</p>
@@ -486,6 +854,21 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
               onClick={generateLegacyFallback}
             >
               ⚙️ Tạo bằng bộ lập kế hoạch đơn lẻ (Legacy Fallback)
+            </button>
+          )}
+          {(error.includes('503') || error.includes('quá tải') || error.includes('Gemini') || error.includes('gemini_transient_failed')) && (
+            <button
+              type="button"
+              className="quick-chip"
+              style={{ marginTop: '6px', background: 'rgba(34, 211, 238, 0.15)', borderColor: 'rgba(34, 211, 238, 0.4)', color: '#22d3ee' }}
+              disabled={busy}
+              onClick={() => {
+                setMode('mock');
+                setError('');
+                void generate('mock');
+              }}
+            >
+              ⚙️ Chuyển sang Mock offline (Khuyến nghị để không bị gián đoạn)
             </button>
           )}
         </div>
@@ -690,8 +1073,8 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="quick-chip" disabled={busy || draft.status === 'approved'} onClick={save}>Lưu & tái kiểm định</button>
             <button className="quick-chip" disabled={busy || draft.status !== 'needs_review'} onClick={review}>Xác nhận rà soát ngữ nghĩa</button>
-            <button className="btn-generate" disabled={busy || hasMathChanges || draft.status !== 'ready_for_approval' || draft.lessonPlan.capabilityReport.renderReadiness !== 'render_ready'} onClick={approve}>Duyệt & render MP4</button>
-            <button className="quick-chip" disabled={busy || draft.status !== 'approved' || !draft.approvedArtifact} onClick={retryEnqueue}>Xếp hàng lại bản đã duyệt</button>
+            <button className="btn-generate" disabled={busy || hasMathChanges || draft.status !== 'ready_for_approval' || draft.lessonPlan.capabilityReport.renderReadiness !== 'render_ready' || (narrationMode === 'gemini_tts' && !confirmExternalApi)} onClick={approve}>Duyệt & render MP4</button>
+            <button className="quick-chip" disabled={busy || draft.status !== 'approved' || !draft.approvedArtifact || (narrationMode === 'gemini_tts' && !confirmExternalApi)} onClick={retryEnqueue}>Xếp hàng lại bản đã duyệt</button>
           </div>
         </div>
       )}
@@ -710,7 +1093,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
               <p role="alert" className="error-message">{job.error}</p>
               {(job.status === 'failed' || job.status === 'interrupted') && draft?.approvedArtifact && (
                 <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
-                  <button type="button" className="quick-chip" disabled={busy} onClick={resumeJob}>
+                  <button type="button" className="quick-chip" disabled={busy || (narrationMode === 'gemini_tts' && !confirmExternalApi)} onClick={resumeJob}>
                     🔄 Tiếp tục Render (Resume từ Checkpoint)
                   </button>
                   <button type="button" className="quick-chip" disabled={busy} onClick={retryEnqueue}>
@@ -721,13 +1104,47 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
             </div>
           )}
           {job.status === 'completed' && job.videoUrl && (
-            <>
-              <video controls src={job.videoUrl} style={{ width: '100%', maxHeight: '480px', borderRadius: '8px', marginTop: '10px' }} />
-              <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
-                <a className="download-link" href={`${job.videoUrl}?download=1`}>Tải MP4 V3</a>
-                <a className="download-link" href={`/api/jobs/${job.jobId}/subtitles`}>Tải phụ đề V3</a>
+            <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+              <div style={{
+                width: '100%',
+                maxWidth: '380px',
+                borderRadius: '16px',
+                overflow: 'hidden',
+                background: '#030712',
+                border: '2px solid rgba(56, 189, 248, 0.4)',
+                boxShadow: '0 12px 36px rgba(0, 0, 0, 0.8), 0 0 20px rgba(56, 189, 248, 0.2)'
+              }}>
+                <div style={{
+                  padding: '8px 14px',
+                  background: 'linear-gradient(90deg, rgba(56, 189, 248, 0.2) 0%, rgba(168, 85, 247, 0.2) 100%)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  borderBottom: '1px solid rgba(56, 189, 248, 0.2)'
+                }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: '#38BDF8' }}>
+                    📱 Lumina Video Player (9:16 HD)
+                  </span>
+                  <span style={{ fontSize: 11, background: '#10B981', color: '#000', padding: '1px 6px', borderRadius: 4, fontWeight: 800 }}>
+                    1080×1920 @ 30 FPS
+                  </span>
+                </div>
+                <video
+                  controls
+                  playsInline
+                  src={job.videoUrl}
+                  style={{ width: '100%', display: 'block', maxHeight: '580px', objectFit: 'contain' }}
+                />
               </div>
-            </>
+              <div style={{ display: 'flex', gap: '10px', marginTop: '14px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                <a className="download-link" href={`${job.videoUrl}?download=1`} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontWeight: 700 }}>
+                  ⬇️ Tải Video MP4 V3 (Bảo Trang TTS + BGM)
+                </a>
+                <a className="download-link" href={`/api/jobs/${job.jobId}/subtitles`} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontWeight: 700 }}>
+                  📝 Tải Phụ Đề (.SRT)
+                </a>
+              </div>
+            </div>
           )}
         </div>
       )}
