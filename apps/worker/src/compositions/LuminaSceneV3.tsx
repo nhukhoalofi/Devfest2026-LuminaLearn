@@ -1,5 +1,5 @@
 import React from 'react';
-import { AbsoluteFill, Sequence, useCurrentFrame, useVideoConfig } from 'remotion';
+import { AbsoluteFill, Audio, Sequence, staticFile, useCurrentFrame, useVideoConfig } from 'remotion';
 import type { EducationalStoryboardV3, EducationalSceneV3 } from '@luminalearn/scene-schema';
 import {
   ConceptIntroScene,
@@ -9,7 +9,17 @@ import {
   SummaryScene,
   GenericPlotScene,
   AlgebraIdentityScene,
-  VisualDslSceneV3
+  AnimatedVisualDslSceneV3,
+  VisualDslSceneV3,
+  FormulaSequenceSceneV3,
+  PhysicsOpticsScene,
+  CinematicPhysicsExplainerScene,
+  supportedSubtitleMathLatex,
+  adaptScalarFunctionGraphV3,
+  adaptGeometry2dV3,
+  adaptDirectedDiagramV3,
+  adaptAttentionMatrixV3,
+  adaptProbabilityTreeV3
 } from '@luminalearn/animation';
 import type { TrustedProofContextV3 } from '@luminalearn/animation';
 
@@ -43,6 +53,10 @@ export const BurnedInSubtitleOverlayV3: React.FC<{
 
   const activeCue = cues.find((c) => frame >= c.startFrame && frame < c.endFrame);
   if (!activeCue || !activeCue.text.trim()) return null;
+  const subtitleMath = supportedSubtitleMathLatex(activeCue.text);
+  // Legacy approved artifacts may contain a formula-only subtitle. The same
+  // expression is now typeset in the scene, so suppress the duplicate raw cue.
+  if (subtitleMath) return null;
 
   return (
     <div
@@ -91,31 +105,127 @@ export const BurnedInSubtitleOverlayV3: React.FC<{
 /**
  * SceneDispatcherV3: Dispatch từng phân cảnh theo sceneType với contract visualPayload nghiêm ngặt.
  */
-export const SceneDispatcherV3: React.FC<{ scene: EducationalSceneV3; subtitlesEnabled: boolean; trustedProofContext?: TrustedProofContextV3 }> = ({ scene, subtitlesEnabled, trustedProofContext }) => {
-  if (scene.visualDefinition) {
-    return <VisualDslSceneV3 definition={scene.visualDefinition} trustedProofContext={trustedProofContext} />;
-  }
+export const SceneDispatcherV3: React.FC<{
+  scene: EducationalSceneV3;
+  subtitlesEnabled: boolean;
+  trustedProofContext?: TrustedProofContextV3;
+  sceneDurationFrames?: number;
+  scalarGraphPhase?: 'introduce_curve' | 'secant_step' | 'secant_motion' | 'tangent_hold';
+}> = ({ scene, subtitlesEnabled, trustedProofContext, sceneDurationFrames, scalarGraphPhase }) => {
   const subtitle = subtitlesEnabled ? (scene.narration.subtitleVietnamese || scene.narration.vietnamese) : undefined;
+  if (scene.visualDefinition) {
+    return (
+      <AnimatedVisualDslSceneV3
+        definition={scene.visualDefinition}
+        trustedProofContext={trustedProofContext}
+        durationInFrames={sceneDurationFrames}
+          subtitleText={subtitle}
+      />
+    );
+  }
   const payload = scene.visualPayload;
+
+  // Universal Scientific Visual Engine auto-dispatch when typed scientificData is bound
+  if ('scientificData' in payload && payload.scientificData) {
+    const sci = payload.scientificData;
+    if (sci.kind === 'verified_formula_steps') {
+      return (
+        <FormulaSequenceSceneV3
+          data={sci}
+          subtitleText={subtitle}
+          durationInFrames={sceneDurationFrames}
+          trustedProofContext={trustedProofContext}
+        />
+      );
+    }
+    if (sci.kind === 'scalar_function_1d') {
+      if ((payload.visualIntent === 'formula_focus' || payload.displayMath?.presentation === 'formula_focus') && payload.sceneType === 'formula_derivation') {
+        return <GenericPlotScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
+      }
+      return (
+        <AnimatedVisualDslSceneV3
+          definition={adaptScalarFunctionGraphV3(sci, scene.sceneId, {
+            phase: scalarGraphPhase,
+            formulaTex: payload.sceneType === 'formula_derivation' ? (payload.displayMath?.latex ?? payload.formulaTex) : undefined
+          })}
+          trustedProofContext={trustedProofContext}
+          durationInFrames={sceneDurationFrames}
+          subtitleText={subtitle}
+        />
+      );
+    }
+    if (sci.kind === 'geometry_2d') {
+      return (
+        <AnimatedVisualDslSceneV3
+          definition={adaptGeometry2dV3(sci, scene.sceneId)}
+          trustedProofContext={trustedProofContext}
+          durationInFrames={sceneDurationFrames}
+          subtitleText={subtitle}
+        />
+      );
+    }
+    if (sci.kind === 'directed_diagram') {
+      return (
+        <AnimatedVisualDslSceneV3
+          definition={adaptDirectedDiagramV3(sci, scene.sceneId)}
+          trustedProofContext={trustedProofContext}
+          durationInFrames={sceneDurationFrames}
+          subtitleText={subtitle}
+        />
+      );
+    }
+    if (sci.kind === 'attention_matrix') {
+      return (
+        <AnimatedVisualDslSceneV3
+          definition={adaptAttentionMatrixV3(sci, scene.sceneId)}
+          trustedProofContext={trustedProofContext}
+          durationInFrames={sceneDurationFrames}
+          subtitleText={subtitle}
+        />
+      );
+    }
+    if (sci.kind === 'probability_tree') {
+      return (
+        <AnimatedVisualDslSceneV3
+          definition={adaptProbabilityTreeV3(sci, scene.sceneId)}
+          trustedProofContext={trustedProofContext}
+          durationInFrames={sceneDurationFrames}
+          subtitleText={subtitle}
+        />
+      );
+    }
+  }
 
   switch (payload.sceneType) {
     case 'concept_intro':
-      return <ConceptIntroScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return <ConceptIntroScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     case 'neural_architecture':
-      return <NeuralArchitectureScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return <NeuralArchitectureScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     case 'loss_landscape':
-      return <LossLandscapeScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return <LossLandscapeScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     case 'attention_heatmap':
-      return <AttentionHeatmapScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return <AttentionHeatmapScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     case 'algebra_identity':
-      return <AlgebraIdentityScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return (
+        <AlgebraIdentityScene
+          title={scene.title}
+          payload={payload}
+          subtitleText={subtitle}
+          durationInFrames={sceneDurationFrames}
+          trustedProofContext={trustedProofContext}
+        />
+      );
+    case 'physics_optics':
+      return <PhysicsOpticsScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
+    case 'physics_explainer':
+      return <CinematicPhysicsExplainerScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     case 'summary':
-      return <SummaryScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return <SummaryScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     case 'formula_derivation':
     case 'graph_plot':
     case 'flowchart_simulation':
     case 'comparison_table':
-      return <GenericPlotScene title={scene.title} payload={payload} subtitleText={subtitle} />;
+      return <GenericPlotScene title={scene.title} payload={payload} subtitleText={subtitle} durationInFrames={sceneDurationFrames} />;
     default: {
       const unsupported: never = payload;
       throw new Error(`unsupported_v3_scene_payload: ${String(unsupported)}`);
@@ -150,15 +260,38 @@ export const LuminaSceneV3: React.FC<LuminaSceneV3Props> = ({
 }) => {
   const { fps } = useVideoConfig();
   const hasAuthoritativeCues = Array.isArray(subtitleCues) && subtitleCues.length > 0;
+  const isPhysicsOptics = storyboard.scenes.some((scene) => scene.sceneType === 'physics_optics' || scene.sceneType === 'physics_explainer');
 
   return (
     <AbsoluteFill style={{ backgroundColor: '#070B14' }}>
+      {isPhysicsOptics && <Audio src={staticFile('audio/rainbow-procedural-score.wav')} volume={0.7} />}
       {/* 1. Sequence từng scene dọc theo timeline */}
       {storyboard.scenes.map((scene, idx) => {
         const startSeconds = storyboard.scenes.slice(0, idx).reduce((sum, item) => sum + item.durationSeconds, 0);
         const endSeconds = startSeconds + scene.durationSeconds;
         const fromFrame = Math.round(startSeconds * fps);
         const sceneDurationFrames = Math.max(1, Math.round(endSeconds * fps) - fromFrame);
+        const scalarGraphScenes = storyboard.scenes.filter((candidate) =>
+          'scientificData' in candidate.visualPayload &&
+          candidate.visualPayload.scientificData?.kind === 'scalar_function_1d'
+        );
+        const scalarGraphIndex = scalarGraphScenes.findIndex((candidate) => candidate.sceneId === scene.sceneId);
+        const typedVisualIntent = 'visualIntent' in scene.visualPayload ? scene.visualPayload.visualIntent : undefined;
+        const scalarGraphPhase = scalarGraphIndex < 0
+          ? undefined
+          : typedVisualIntent === 'curve_introduction'
+            ? 'introduce_curve' as const
+            : typedVisualIntent === 'limit_transition'
+              ? 'secant_motion' as const
+              : typedVisualIntent === 'secant_measurement'
+                ? 'secant_step' as const
+                : typedVisualIntent === 'tangent_result' || typedVisualIntent === 'formula_focus'
+                  ? 'tangent_hold' as const
+          : scalarGraphIndex === 0
+            ? 'introduce_curve' as const
+            : 'scientificData' in scene.visualPayload && scene.visualPayload.scientificData?.kind === 'scalar_function_1d' && scene.visualPayload.scientificData.secantFromX !== undefined
+              ? 'secant_step' as const
+              : 'tangent_hold' as const;
 
         return (
           <Sequence
@@ -172,6 +305,8 @@ export const LuminaSceneV3: React.FC<LuminaSceneV3Props> = ({
               scene={scene}
               subtitlesEnabled={hasAuthoritativeCues ? false : subtitlesEnabled}
               trustedProofContext={trustedProofContext}
+              sceneDurationFrames={sceneDurationFrames}
+              scalarGraphPhase={scalarGraphPhase}
             />
           </Sequence>
         );

@@ -20,6 +20,22 @@ describe('Quality Sprint B scientific visual adapters', () => {
     assert.equal(scene.style, 'ai_data_story');
   });
 
+  it('uses progressive graph phases instead of restarting the curve in every scene', () => {
+    const input = { kind: 'scalar_function_1d' as const, functionType: 'polynomial' as const, expression: 'x^2', xRange: [-1, 3] as [number, number], yRange: [-1, 9] as [number, number], pointX: 1, tangentAtX: 1, secantFromX: 1, secantToX: 2, claimId: 'claim_derivative', validation: 'formally_verified' as const };
+    const introduction = adaptScalarFunctionGraphV3(input, 'intro', { phase: 'introduce_curve' });
+    const secant = adaptScalarFunctionGraphV3(input, 'secant', { phase: 'secant_step', formulaTex: 'm_{PQ}=3' });
+    const tangent = adaptScalarFunctionGraphV3(input, 'tangent', { phase: 'tangent_hold' });
+    const motion = adaptScalarFunctionGraphV3({ ...input, secantProgression: [2, 1.5, 1.05] }, 'motion', { phase: 'secant_motion' });
+    const animationOf = (scene: typeof introduction) => scene.elements.find((element) => element.elementType === 'graph')?.animation;
+    assert.equal(animationOf(introduction), 'draw_line');
+    assert.equal(animationOf(secant), 'step_reveal');
+    assert.equal(animationOf(tangent), 'fade_in');
+    assert.equal(animationOf(motion), 'spring_scale');
+    const formula = secant.elements.find((element) => element.elementType === 'formula');
+    assert.equal(formula?.elementType === 'formula' ? formula.latex : undefined, 'm_{PQ}=3');
+    assert.equal(formula && 'claimId' in formula ? formula.claimId : undefined, undefined);
+  });
+
   it('builds directed diagrams from typed nodes and edges rather than a fixed network', () => {
     const scene = adaptDirectedDiagramV3({ kind: 'directed_diagram', nodes: [
       { nodeId: 'input_one', label: 'Input', layer: 0 }, { nodeId: 'hidden_one', label: 'Hidden', layer: 1 }, { nodeId: 'output_one', label: 'Output', layer: 2 }
@@ -49,17 +65,17 @@ describe('Quality Sprint B scientific visual adapters', () => {
     const scene = adaptGeometry2dV3({
       kind: 'geometry_2d',
       points: [
-        { pointId: 'A', x: 0, y: 0 },
-        { pointId: 'B', x: 4, y: 0 },
-        { pointId: 'C', x: 0, y: 3 }
+        { pointId: 'point_A', x: 0, y: 0 },
+        { pointId: 'point_B', x: 4, y: 0 },
+        { pointId: 'point_C', x: 0, y: 3 }
       ],
       segments: [
-        { fromPointId: 'A', toPointId: 'B' },
-        { fromPointId: 'B', toPointId: 'C' },
-        { fromPointId: 'C', toPointId: 'A' }
+        { fromPointId: 'point_A', toPointId: 'point_B' },
+        { fromPointId: 'point_B', toPointId: 'point_C' },
+        { fromPointId: 'point_C', toPointId: 'point_A' }
       ],
       polygons: [
-        { pointIds: ['A', 'B', 'C'], areaClaimId: 'claim_triangle_area' }
+        { pointIds: ['point_A', 'point_B', 'point_C'], areaClaimId: 'claim_triangle_area' }
       ],
       claimIds: ['claim_triangle_area'],
       validation: 'formally_verified'
@@ -67,6 +83,8 @@ describe('Quality Sprint B scientific visual adapters', () => {
     assert.equal(scene.elements.filter((el) => el.elementType === 'point').length, 3);
     assert.equal(scene.elements.filter((el) => el.elementType === 'segment').length, 3);
     assert.equal(scene.elements.filter((el) => el.elementType === 'polygon').length, 1);
+    const firstPoint = scene.elements.find((el) => el.elementType === 'point');
+    assert.equal(firstPoint && 'label' in firstPoint ? firstPoint.label : undefined, 'A(0,0)');
   });
 
   it('builds probability tree hierarchical nodes and branch edges', () => {

@@ -223,6 +223,12 @@ export const GenericSceneVisualPayloadSchema = z.object({
   sceneType: z.enum(['formula_derivation', 'graph_plot', 'flowchart_simulation', 'comparison_table']),
   headline: NoExecutableString.optional(),
   formulaTex: NoExecutableString.optional(),
+  displayMath: z.object({
+    latex: z.string().trim().min(1).max(300),
+    accessibleText: NoExecutableString,
+    presentation: z.enum(['graph_overlay', 'formula_focus']).default('graph_overlay')
+  }).strict().optional(),
+  visualIntent: z.enum(['curve_introduction', 'secant_measurement', 'limit_transition', 'tangent_result', 'formula_focus']).optional(),
   notes: NoExecutableString.optional(),
   scientificData: ScientificVisualDataV1Schema.optional()
 }).strict();
@@ -251,6 +257,221 @@ export const AlgebraIdentityVisualPayloadSchema = z.object({
 });
 export type AlgebraIdentityVisualPayload = z.infer<typeof AlgebraIdentityVisualPayloadSchema>;
 
+// 7. Physics Optics Visual Payload
+// Numeric bounds are intentionally narrow: AI may choose the pedagogical stage,
+// but it cannot invent refractive indices or rainbow exit angles outside the
+// supported geometric-optics model.
+export const PhysicsOpticsStageV3Schema = z.enum([
+  'hook',
+  'white_light_spectrum',
+  'entry_refraction',
+  'internal_reflection',
+  'exit_angles',
+  'observer_arc'
+]);
+export type PhysicsOpticsStageV3 = z.infer<typeof PhysicsOpticsStageV3Schema>;
+
+export const PhysicsOpticsVisualPayloadSchema = z.object({
+  sceneType: z.literal('physics_optics'),
+  stage: PhysicsOpticsStageV3Schema,
+  headline: NoExecutableString,
+  focusLabel: NoExecutableString,
+  airRefractiveIndex: z.number().finite().min(0.999).max(1.001).default(1),
+  waterRefractiveIndices: z.object({
+    red: z.number().finite().min(1.32).max(1.35),
+    violet: z.number().finite().min(1.33).max(1.36)
+  }).strict(),
+  primaryRainbowAnglesDeg: z.object({
+    red: z.number().finite().min(41.5).max(43),
+    violet: z.number().finite().min(39.5).max(41.5)
+  }).strict(),
+  showNormals: z.boolean().default(false),
+  cameraMove: z.enum(['push_in', 'track_ray', 'orbit_drop', 'pull_out']).default('track_ray'),
+  accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#38BDF8')
+}).strict().superRefine((payload, ctx) => {
+  if (payload.waterRefractiveIndices.violet <= payload.waterRefractiveIndices.red) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['waterRefractiveIndices'], message: 'Chiết suất tím phải lớn hơn chiết suất đỏ trong mô hình tán sắc nước.' });
+  }
+  if (payload.primaryRainbowAnglesDeg.red <= payload.primaryRainbowAnglesDeg.violet) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['primaryRainbowAnglesDeg'], message: 'Góc cầu vồng chính của tia đỏ phải lớn hơn tia tím.' });
+  }
+  const causticAngle = (n: number) => {
+    const incident = Math.acos(Math.sqrt((n * n - 1) / 3));
+    const refracted = Math.asin(Math.sin(incident) / n);
+    return Math.abs((4 * refracted - 2 * incident) * 180 / Math.PI);
+  };
+  const expectedRed = causticAngle(payload.waterRefractiveIndices.red);
+  const expectedViolet = causticAngle(payload.waterRefractiveIndices.violet);
+  if (Math.abs(payload.primaryRainbowAnglesDeg.red - expectedRed) > 0.35) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['primaryRainbowAnglesDeg', 'red'], message: `Góc đỏ không khớp mô hình Descartes; xấp xỉ ${expectedRed.toFixed(2)}°.` });
+  }
+  if (Math.abs(payload.primaryRainbowAnglesDeg.violet - expectedViolet) > 0.35) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['primaryRainbowAnglesDeg', 'violet'], message: `Góc tím không khớp mô hình Descartes; xấp xỉ ${expectedViolet.toFixed(2)}°.` });
+  }
+});
+export type PhysicsOpticsVisualPayload = z.infer<typeof PhysicsOpticsVisualPayloadSchema>;
+
+// 8. Reusable cinematic physics formats extracted from the approved reference
+// videos. Content generation may choose a family and beat, but every simulation
+// parameter stays inside a bounded, typed contract.
+export const PhysicsExplainerFamilyV3Schema = z.enum([
+  'process_chain',
+  'particle_state',
+  'wave_propagation',
+  'force_motion',
+  'energy_transfer'
+]);
+export type PhysicsExplainerFamilyV3 = z.infer<typeof PhysicsExplainerFamilyV3Schema>;
+
+export const PhysicsExplainerBeatV3Schema = z.enum([
+  'hook',
+  'system_model',
+  'mechanism_a',
+  'mechanism_b',
+  'evidence',
+  'takeaway'
+]);
+
+const ProcessChainSimulationV3Schema = z.object({
+  kind: z.literal('process_chain'),
+  nodes: z.array(NoExecutableString).min(3).max(7),
+  activeNodeIndex: z.number().int().min(0).max(6),
+  carrierLabel: NoExecutableString
+}).strict();
+
+const ParticleStateSimulationV3Schema = z.object({
+  kind: z.literal('particle_state'),
+  particleCount: z.number().int().min(12).max(60),
+  temperature: z.enum(['low', 'medium', 'high']),
+  phase: z.enum(['gas', 'liquid', 'condensing']),
+  surfaceTemperatureC: z.number().finite().min(-50).max(100).optional(),
+  dewPointC: z.number().finite().min(-50).max(60).optional()
+}).strict();
+
+const WaveSimulationV3Schema = z.object({
+  kind: z.literal('wave'),
+  amplitude: z.number().finite().min(20).max(120),
+  spatialFrequency: z.number().finite().min(0.5).max(8),
+  propagationSpeed: z.number().finite().min(0.5).max(10),
+  wavelengthLabel: NoExecutableString,
+  relationLabel: NoExecutableString,
+  frequencyHz: z.number().finite().positive().max(100_000).optional(),
+  wavelengthMeters: z.number().finite().positive().max(10_000).optional(),
+  physicalSpeedMps: z.number().finite().positive().max(400_000_000).optional()
+}).strict();
+
+const ForceSimulationV3Schema = z.object({
+  kind: z.literal('force_motion'),
+  objectType: z.enum(['box', 'sphere', 'pendulum', 'coil', 'projectile', 'car', 'apple', 'submarine', 'skater']),
+  motionModel: z.enum(['static', 'oscillatory', 'projectile']).default('static'),
+  formula: NoExecutableString,
+  forces: z.array(z.object({
+    label: NoExecutableString,
+    color: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+    angleDeg: z.number().finite().min(0).max(360),
+    magnitude: z.number().finite().min(20).max(220)
+  }).strict()).min(1).max(6),
+  massKg: z.number().finite().positive().max(10_000).optional(),
+  accelerationMps2: z.number().finite().min(-1000).max(1000).optional(),
+  netForceN: z.number().finite().min(-1_000_000).max(1_000_000).optional(),
+  gravityMps2: z.number().finite().min(9).max(10).optional(),
+  initialSpeedMps: z.number().finite().positive().max(500).optional(),
+  launchAngleDeg: z.number().finite().min(1).max(89).optional(),
+  pendulumLengthM: z.number().finite().positive().max(20).optional(),
+  periodSeconds: z.number().finite().positive().max(30).optional()
+}).strict();
+
+const EnergySimulationV3Schema = z.object({
+  kind: z.literal('energy_transfer'),
+  kineticFraction: z.number().finite().min(0).max(1),
+  potentialFraction: z.number().finite().min(0).max(1),
+  totalEnergyLabel: NoExecutableString
+}).strict();
+
+export const PhysicsExplainerSimulationV3Schema = z.discriminatedUnion('kind', [
+  ProcessChainSimulationV3Schema,
+  ParticleStateSimulationV3Schema,
+  WaveSimulationV3Schema,
+  ForceSimulationV3Schema,
+  EnergySimulationV3Schema
+]);
+
+export const PhysicsExplainerVisualPayloadSchema = z.object({
+  sceneType: z.literal('physics_explainer'),
+  family: PhysicsExplainerFamilyV3Schema,
+  beat: PhysicsExplainerBeatV3Schema,
+  headline: NoExecutableString,
+  focusLabel: NoExecutableString,
+  insight: NoExecutableString,
+  simulation: PhysicsExplainerSimulationV3Schema,
+  cameraMove: z.enum(['push_in', 'track', 'macro', 'pull_out']).default('track'),
+  accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#38BDF8')
+}).strict().superRefine((payload, ctx) => {
+  const allowedKindByFamily: Record<z.infer<typeof PhysicsExplainerFamilyV3Schema>, z.infer<typeof PhysicsExplainerSimulationV3Schema>['kind']> = {
+    process_chain: 'process_chain',
+    particle_state: 'particle_state',
+    wave_propagation: 'wave',
+    force_motion: 'force_motion',
+    energy_transfer: 'energy_transfer'
+  };
+  if (payload.simulation.kind !== allowedKindByFamily[payload.family]) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'kind'], message: 'Kiểu mô phỏng không khớp format family đã chọn.' });
+  }
+  if (payload.simulation.kind === 'process_chain' && payload.simulation.activeNodeIndex >= payload.simulation.nodes.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'activeNodeIndex'], message: 'Nút đang hoạt động phải tồn tại trong chuỗi quá trình.' });
+  }
+  if (payload.simulation.kind === 'particle_state' && payload.simulation.phase === 'condensing') {
+    if (payload.simulation.surfaceTemperatureC === undefined || payload.simulation.dewPointC === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'surfaceTemperatureC'], message: 'Mô phỏng ngưng tụ cần nhiệt độ bề mặt và điểm sương.' });
+    } else if (payload.simulation.surfaceTemperatureC > payload.simulation.dewPointC) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'surfaceTemperatureC'], message: 'Ngưng tụ chỉ được mô phỏng khi bề mặt không nóng hơn điểm sương.' });
+    }
+  }
+  if (payload.simulation.kind === 'energy_transfer' && Math.abs(payload.simulation.kineticFraction + payload.simulation.potentialFraction - 1) > 0.001) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'kineticFraction'], message: 'Các phần năng lượng phải bảo toàn tổng bằng 1 trong mô hình lý tưởng.' });
+  }
+  if (payload.simulation.kind === 'wave') {
+    const { frequencyHz, wavelengthMeters, physicalSpeedMps } = payload.simulation;
+    const supplied = [frequencyHz, wavelengthMeters, physicalSpeedMps].filter((value) => value !== undefined).length;
+    if (supplied > 0 && supplied < 3) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation'], message: 'Kiểm định sóng cần đủ tần số, bước sóng và vận tốc truyền.' });
+    } else if (frequencyHz !== undefined && wavelengthMeters !== undefined && physicalSpeedMps !== undefined) {
+      const expected = frequencyHz * wavelengthMeters;
+      if (Math.abs(physicalSpeedMps - expected) / expected > 0.001) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'physicalSpeedMps'], message: 'Vận tốc truyền phải thỏa v = fλ.' });
+      }
+    }
+  }
+  if (payload.simulation.kind === 'force_motion') {
+    const simulation = payload.simulation;
+    if (simulation.objectType === 'projectile' || simulation.motionModel === 'projectile') {
+      if (simulation.initialSpeedMps === undefined || simulation.launchAngleDeg === undefined || simulation.gravityMps2 === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation'], message: 'Ném xiên cần vận tốc đầu, góc phóng và gia tốc trọng trường.' });
+      }
+    }
+    if (simulation.objectType === 'pendulum' || simulation.motionModel === 'oscillatory') {
+      if (simulation.pendulumLengthM === undefined || simulation.gravityMps2 === undefined || simulation.periodSeconds === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation'], message: 'Con lắc cần chiều dài, gia tốc trọng trường và chu kỳ.' });
+      } else {
+        const expectedPeriod = 2 * Math.PI * Math.sqrt(simulation.pendulumLengthM / simulation.gravityMps2);
+        if (Math.abs(simulation.periodSeconds - expectedPeriod) > 0.02) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'periodSeconds'], message: 'Chu kỳ phải khớp mô hình góc nhỏ T = 2π√(L/g).' });
+        }
+      }
+    }
+    const dynamicsValues = [simulation.massKg, simulation.accelerationMps2, simulation.netForceN];
+    const suppliedDynamics = dynamicsValues.filter((value) => value !== undefined).length;
+    if (suppliedDynamics > 0 && suppliedDynamics < 3) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation'], message: 'Kiểm định động lực học cần đủ khối lượng, gia tốc và hợp lực.' });
+    } else if (simulation.massKg !== undefined && simulation.accelerationMps2 !== undefined && simulation.netForceN !== undefined) {
+      if (Math.abs(simulation.netForceN - simulation.massKg * simulation.accelerationMps2) > 0.001) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['simulation', 'netForceN'], message: 'Hợp lực phải thỏa F = ma.' });
+      }
+    }
+  }
+});
+export type PhysicsExplainerVisualPayload = z.infer<typeof PhysicsExplainerVisualPayloadSchema>;
+
 // Union của toàn bộ visual payloads có kiểm định chặt chẽ
 export const EducationalVisualPayloadSchema = z.union([
   ConceptIntroVisualPayloadSchema,
@@ -258,6 +479,8 @@ export const EducationalVisualPayloadSchema = z.union([
   LossLandscapeVisualPayloadSchema,
   AttentionHeatmapVisualPayloadSchema,
   AlgebraIdentityVisualPayloadSchema,
+  PhysicsOpticsVisualPayloadSchema,
+  PhysicsExplainerVisualPayloadSchema,
   SummaryVisualPayloadSchema,
   GenericSceneVisualPayloadSchema
 ]);
@@ -342,6 +565,7 @@ export const VisualFormulaElementSchema = z.object({
   contentPolicy: MathContentPolicySchema.optional(),
   fontSize: z.number().min(12).max(72).default(36),
   color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#38BDF8'),
+  position: z.object({ x: z.number().finite(), y: z.number().finite() }).optional(),
   animation: VisualAnimationPresetV3Schema.default('step_reveal')
 }).strict();
 
@@ -359,6 +583,7 @@ export const VisualGraphElementSchema = z.object({
   showSecantLine: z.boolean().optional(),
   secantFromX: z.number().finite().optional(),
   secantToX: z.number().finite().optional(),
+  secantProgression: z.array(z.number().finite()).min(2).max(12).optional(),
   animation: VisualAnimationPresetV3Schema.default('draw_line')
 }).strict();
 
@@ -624,12 +849,12 @@ export const VisualSceneDefinitionV3Schema = z.object({
   });
   scene.mathBindings.forEach((binding, index) => {
     const element = scene.elements.find((candidate) => candidate.elementId === binding.elementId);
-    if (!element || (element.elementType !== 'formula' && element.elementType !== 'graph')) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mathBindings', index, 'elementId'], message: 'Math binding phải tham chiếu formula hoặc graph element tồn tại' });
+    if (!element || (element.elementType !== 'formula' && element.elementType !== 'graph' && element.elementType !== 'polygon')) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mathBindings', index, 'elementId'], message: 'Math binding phải tham chiếu formula, graph hoặc polygon element tồn tại' });
   });
   scene.trustedMathBindings.forEach((binding, index) => {
     const element = scene.elements.find((candidate) => candidate.elementId === binding.elementId);
-    if (!element || (element.elementType !== 'formula' && element.elementType !== 'graph') || element.claimId !== binding.claimId || binding.sourceSceneId !== scene.sceneId) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['trustedMathBindings', index], message: 'Trusted binding phải khớp formula/graph, claim và scene hiện tại' });
+    if (!element || (element.elementType !== 'formula' && element.elementType !== 'graph' && element.elementType !== 'polygon') || element.claimId !== binding.claimId || binding.sourceSceneId !== scene.sceneId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['trustedMathBindings', index], message: 'Trusted binding phải khớp formula/graph/polygon, claim và scene hiện tại' });
     }
   });
   scene.dataBindings.forEach((binding, index) => {
@@ -644,5 +869,6 @@ export type VisualSceneDefinitionV3 = z.infer<typeof VisualSceneDefinitionV3Sche
 export const VISUAL_PRIMITIVE_READINESS_V3 = {
   text: 'render_ready', formula: 'render_ready', graph: 'render_ready', axes: 'render_ready', point: 'render_ready',
   arrow: 'render_ready', matrix: 'render_ready', labeled_step: 'render_ready', neural_node: 'render_ready', neural_connection: 'render_ready',
-  vector: 'schema_only', chart: 'schema_only', shape: 'schema_only', callout: 'schema_only', highlighted_region: 'schema_only', timeline_marker: 'schema_only'
+  vector: 'schema_only', chart: 'schema_only', shape: 'schema_only', callout: 'schema_only', highlighted_region: 'schema_only', timeline_marker: 'schema_only',
+  segment: 'preview_ready', polygon: 'preview_ready'
 } as const satisfies Record<VisualElementV3['elementType'], 'schema_only' | 'preview_ready' | 'render_ready' | 'end_to_end_verified'>;

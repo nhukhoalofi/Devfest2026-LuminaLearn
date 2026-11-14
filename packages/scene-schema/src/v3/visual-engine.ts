@@ -57,6 +57,7 @@ export const ScalarFunctionDataV1Schema = z.object({
   tangentAtX: z.number().finite().optional(),
   secantFromX: z.number().finite().optional(),
   secantToX: z.number().finite().optional(),
+  secantProgression: z.array(z.number().finite()).min(2).max(12).optional(),
   claimId: SafeIdString,
   validation: z.literal('formally_verified')
 }).strict().superRefine((data, ctx) => {
@@ -74,6 +75,16 @@ export const ScalarFunctionDataV1Schema = z.object({
   if (data.secantFromX !== undefined && data.secantToX !== undefined && data.secantFromX === data.secantToX) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['secantToX'], message: 'A secant requires two distinct x coordinates.' });
   }
+  if (data.secantProgression) {
+    if (data.secantFromX === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['secantProgression'], message: 'secantProgression requires secantFromX.' });
+    }
+    data.secantProgression.forEach((value, index) => {
+      if (value < data.xRange[0] || value > data.xRange[1] || value === data.secantFromX) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['secantProgression', index], message: 'Every progression value must be inside xRange and distinct from secantFromX.' });
+      }
+    });
+  }
 });
 
 export const OptimizationTraceDataV1Schema = z.object({
@@ -88,7 +99,79 @@ export const OptimizationTraceDataV1Schema = z.object({
   }).strict()).min(2).max(20),
   claimId: SafeIdString,
   validation: z.literal('deterministic_numeric')
-}).strict();
+}).strict().superRefine((data, ctx) => {
+  for (let i = 0; i < data.points.length - 1; i++) {
+    if (data.points[i + 1].step <= data.points[i].step) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['points', i + 1, 'step'], message: 'Optimization trace steps must strictly increase.' });
+    }
+  }
+
+  const fullExpr = data.expression.trim();
+  // Form A: [L(w) =] [a *] (w [-+] h)^2 [[-+] k]
+  const matchA = /^(?:L\(w\)\s*=\s*)?([+-]?\d*(?:\.\d+)?)\s*\*?\s*\(\s*w\s*([+-])\s*(\d+(?:\.\d+)?)\s*\)\^2(?:\s*([+-])\s*(\d+(?:\.\d+)?))?$/.exec(fullExpr);
+  // Form B: [L(w) =] [a *] w^2 [[-+] k]
+  const matchB = /^(?:L\(w\)\s*=\s*)?([+-]?\d*(?:\.\d+)?)\s*\*?\s*w\^2(?:\s*([+-])\s*(\d+(?:\.\d+)?))?$/.exec(fullExpr);
+
+  if (!matchA && !matchB) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['expression'],
+      message: `Unsupported optimization expression '${data.expression}'. Currently only 1D convex quadratics of the form a*(w-h)^2 + k or a*w^2 + k are supported for deterministic numeric validation.`
+    });
+    return;
+  }
+
+  let a = 1;
+  let h = 0;
+  let k = 0;
+
+  if (matchA) {
+    const aStr = matchA[1];
+    a = aStr === '' || aStr === '+' ? 1 : aStr === '-' ? -1 : Number(aStr);
+    const signH = matchA[2];
+    const valH = Number(matchA[3]);
+    h = signH === '-' ? valH : -valH;
+    if (matchA[4] && matchA[5]) {
+      k = matchA[4] === '-' ? -Number(matchA[5]) : Number(matchA[5]);
+    }
+  } else if (matchB) {
+    const aStr = matchB[1];
+    a = aStr === '' || aStr === '+' ? 1 : aStr === '-' ? -1 : Number(aStr);
+    h = 0;
+    if (matchB[3] && matchB[4]) {
+      k = matchB[3] === '-' ? -Number(matchB[4]) : Number(matchB[4]);
+    }
+  }
+
+  if (a <= 0 || !Number.isFinite(a)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['expression'],
+      message: `Loss function curvature 'a' must be strictly positive and finite (received ${a}).`
+    });
+    return;
+  }
+
+  const tol = 1e-4;
+  data.points.forEach((pt, index) => {
+    const delta = pt.parameter - h;
+    const expectedValue = a * delta * delta + k;
+    const expectedGrad = 2 * a * delta;
+    if (Math.abs(pt.value - expectedValue) > tol) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['points', index, 'value'], message: `Loss value ${pt.value} does not match expression (expected ~${expectedValue.toFixed(4)}).` });
+    }
+    if (Math.abs(pt.gradient - expectedGrad) > tol) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['points', index, 'gradient'], message: `Gradient ${pt.gradient} does not match derivative (expected ~${expectedGrad.toFixed(4)}).` });
+    }
+    if (index < data.points.length - 1) {
+      const next = data.points[index + 1];
+      const expectedNextParam = pt.parameter - data.learningRate * pt.gradient;
+      if (Math.abs(next.parameter - expectedNextParam) > tol) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['points', index + 1, 'parameter'], message: `Parameter update ${next.parameter} does not follow gradient descent (expected ~${expectedNextParam.toFixed(4)}).` });
+      }
+    }
+  });
+});
 
 const GeometryPointV1Schema = z.object({
   pointId: SafeIdString,
@@ -100,7 +183,12 @@ export const Geometry2dDataV1Schema = z.object({
   kind: z.literal('geometry_2d'),
   points: z.array(GeometryPointV1Schema).min(2).max(24),
   segments: z.array(z.object({ fromPointId: SafeIdString, toPointId: SafeIdString }).strict()).max(36),
-  polygons: z.array(z.object({ pointIds: z.array(SafeIdString).min(3).max(12), areaClaimId: SafeIdString.optional() }).strict()).max(8),
+  polygons: z.array(z.object({
+    pointIds: z.array(SafeIdString).min(3).max(12),
+    areaClaimId: SafeIdString.optional(),
+    label: z.string().trim().max(64).optional(),
+    fill: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional()
+  }).strict()).max(8),
   claimIds: z.array(SafeIdString).default([]),
   validation: z.enum(['formally_verified', 'human_review_required'])
 }).strict().superRefine((data, ctx) => {
@@ -129,8 +217,8 @@ export const DirectedDiagramDataV1Schema = z.object({
 
 export const AttentionMatrixDataV1Schema = z.object({
   kind: z.literal('attention_matrix'),
-  tokens: z.array(NoExecutableString).min(2).max(12),
-  weights: z.array(z.array(z.number().finite().min(0).max(1))).min(2).max(12),
+  tokens: z.array(NoExecutableString).min(2).max(8),
+  weights: z.array(z.array(z.number().finite().min(0).max(1))).min(2).max(8),
   validation: z.enum(['deterministic_numeric', 'human_review_required'])
 }).strict().superRefine((data, ctx) => {
   const size = data.tokens.length;

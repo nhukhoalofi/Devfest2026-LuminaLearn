@@ -1,4 +1,5 @@
 export * from './ffprobe';
+export * from './v3-media-quality';
 export * from './paths';
 export * from './request';
 export * from './manifest';
@@ -19,4 +20,5 @@ export * from './longform-renderer-v3';
 export * from './vietnamese-narration-normalizer';
 export * from './audio-cache-manager';
 export * from './scene-audio-synchronizer';
+export * from './dutai-tts';
 

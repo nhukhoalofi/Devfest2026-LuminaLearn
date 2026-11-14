@@ -2,26 +2,30 @@ import React from 'react';
 import { AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig } from 'remotion';
 import type { GenericSceneVisualPayload } from '@luminalearn/scene-schema';
 import { MathExpression } from './MathExpression';
+import { formatEducationalMathDisplay } from './educational-math-display';
 
 export interface GenericPlotSceneProps {
   title: string;
   payload: GenericSceneVisualPayload;
   subtitleText?: string;
+  durationInFrames?: number;
 }
 
 export const GenericPlotScene: React.FC<GenericPlotSceneProps> = ({
   title,
   payload,
-  subtitleText
+  subtitleText,
+  durationInFrames: propDuration
 }) => {
   const frame = useCurrentFrame();
-  const { fps, durationInFrames } = useVideoConfig();
+  const { fps, durationInFrames: videoDuration } = useVideoConfig();
+  const effectiveDuration = propDuration ?? videoDuration;
 
   const sceneProgress = spring({ frame, fps, config: { damping: 15, stiffness: 90 } });
 
   const exitOpacity = interpolate(
     frame,
-    [Math.max(0, durationInFrames - 12), durationInFrames],
+    [Math.max(0, effectiveDuration - 12), effectiveDuration],
     [1, 0],
     { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
   );
@@ -83,7 +87,7 @@ export const GenericPlotScene: React.FC<GenericPlotSceneProps> = ({
           </div>
         )}
 
-        {payload.formulaTex && (
+        {(payload.displayMath?.latex || payload.formulaTex) && (
           <div
             style={{
               backgroundColor: '#0F172A',
@@ -99,13 +103,13 @@ export const GenericPlotScene: React.FC<GenericPlotSceneProps> = ({
               overflowWrap: 'break-word'
             }}
           >
-            <MathExpression expression={payload.formulaTex} fontSize={32} maxWidthPx={560} />
+            <MathExpression expression={payload.displayMath?.latex ?? payload.formulaTex!} fontSize={32} maxWidthPx={560} />
           </div>
         )}
 
         {payload.notes && (
           <div style={{ fontSize: 18, color: '#94A3B8', textAlign: 'center', lineHeight: 1.4 }}>
-            {payload.notes}
+            {formatEducationalMathDisplay(payload.notes)}
           </div>
         )}
       </div>
@@ -113,7 +117,7 @@ export const GenericPlotScene: React.FC<GenericPlotSceneProps> = ({
       {/* Subtitle */}
       {subtitleText && (
         <div style={{ textAlign: 'center', fontSize: 18, color: '#94A3B8', fontStyle: 'italic' }}>
-          {subtitleText}
+          {formatEducationalMathDisplay(subtitleText)}
         </div>
       )}
     </AbsoluteFill>
