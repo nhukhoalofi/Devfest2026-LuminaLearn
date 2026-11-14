@@ -14,7 +14,7 @@ import {
   framesToSeconds
 } from '@luminalearn/scene-schema';
 import { LongFormMediaAssemblerV3, probeMediaWithFFprobe, computeFileSha256 } from './longform-assembler-v3';
-import { verifyV3ArtifactIntegrity } from './pipeline-v3';
+import { verifyV3ArtifactIntegrity, deriveTrustedProofContextV3 } from './pipeline-v3';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -362,7 +362,8 @@ export class SegmentRenderWorkerV3 implements ISegmentRenderWorkerV3 {
       propsPath,
       JSON.stringify({
         storyboard: segmentStoryboard,
-        subtitlesEnabled: context.subtitlesEnabled ?? true
+        subtitlesEnabled: context.subtitlesEnabled ?? true,
+        trustedProofContext: deriveTrustedProofContextV3(context.approvedArtifact)
       }),
       'utf8'
     );
@@ -565,6 +566,7 @@ export class LongFormRenderCoordinatorV3 {
         }
 
         let segmentOutputPath: string | undefined;
+        let reusedCheckpointRecord = false;
 
         // 1. Check if already completed in checkpoint
         const priorCompleted = completedMap[segment.segmentId];
@@ -573,13 +575,20 @@ export class LongFormRenderCoordinatorV3 {
           try {
             const actualHash = await computeFileSha256(priorCompleted.outputPath);
             if (actualHash === priorCompleted.fileSHA256) {
-              segmentOutputPath = priorCompleted.outputPath;
-              segment.status = 'cached';
+              const probe = await probeMediaWithFFprobe(priorCompleted.outputPath);
+              const expectedDuration = framesToSeconds(segment.durationFrames, manifest.fps);
+              if (probe.width === manifest.width && probe.height === manifest.height && probe.fps === manifest.fps &&
+                  Math.abs(probe.durationSeconds - expectedDuration) <= 0.5) {
+                segmentOutputPath = priorCompleted.outputPath;
+                segment.status = 'cached';
+                reusedCheckpointRecord = true;
+              }
             }
           } catch {
             // File missing or unreadable - must re-render
             segmentOutputPath = undefined;
           }
+          if (!reusedCheckpointRecord) delete completedMap[segment.segmentId];
         }
 
         // 2. Check content-addressable cache if not resumed from checkpoint
@@ -636,13 +645,15 @@ export class LongFormRenderCoordinatorV3 {
         segmentPaths.push(segmentOutputPath);
 
         // Record completed segment in checkpoint
-        const fileSHA256 = await computeFileSha256(segmentOutputPath);
-        completedMap[segment.segmentId] = {
-          segmentId: segment.segmentId,
-          outputPath: segmentOutputPath,
-          fileSHA256,
-          completedAt: new Date().toISOString()
-        };
+        if (!reusedCheckpointRecord) {
+          const fileSHA256 = await computeFileSha256(segmentOutputPath);
+          completedMap[segment.segmentId] = {
+            segmentId: segment.segmentId,
+            outputPath: segmentOutputPath,
+            fileSHA256,
+            completedAt: new Date().toISOString()
+          };
+        }
 
         job = {
           ...job,

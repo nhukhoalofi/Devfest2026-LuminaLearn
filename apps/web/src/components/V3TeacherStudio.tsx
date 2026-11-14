@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { ChapterNavigatorV3 } from './ChapterNavigatorV3';
-import { TimelineEditorV3 } from './TimelineEditorV3';
+import { TimelineViewerV3 } from './TimelineEditorV3';
 import { MathematicalVerificationPanelV3 } from './MathematicalVerificationPanelV3';
 import { SceneInspectorV3 } from './SceneInspectorV3';
 
@@ -21,10 +21,15 @@ type Scene = {
   durationSeconds: number;
   narration: { vietnamese: string; subtitleVietnamese: string };
   visualPayload: unknown;
+  visualDefinition?: any;
 };
 type AgentTask = { taskId: string; role: string; title: string; status: string; validationStatus: string; durationMs?: number };
 type SupervisorTrace = { supervisorRunId: string; status: string; elapsedMs: number; humanReadableSummary: string; tasks: AgentTask[] };
 type Chapter = { chapterId: string; chapterTitle: string; durationSeconds: number; sceneIds?: string[] };
+type PedagogicalBeat = { beatId: string; sceneId: string; learningObjective: string; pedagogicalIntent: string; educationalQuestion: string; visualIntent: string; expectedLearnerTakeaway: string; contentValidationStatus: string };
+type WorkedExample = { exampleId: string; title: string; sourceExpression: string; verificationStatus: string; steps: Array<{ stepId: string; displayExpression: string; narrationText: string; verificationStatus: string }> };
+type QualityFinding = { findingId: string; code: string; status: string; message: string; sceneId?: string; remediation?: string };
+type VisualIntentMapping = { visualIntent: string; recommendedActions: string[]; readiness: string; reviewReason?: string };
 type Draft = {
   draftId: string;
   version: number;
@@ -39,6 +44,13 @@ type Draft = {
     storyboard?: { totalDurationSeconds: number; scenes: Scene[]; chapters?: Chapter[] };
     validationReport?: { overallStatus: string; requiresHumanPedagogicalSignoff: boolean };
     capabilityReport: { renderReadiness: string; limitations: string[] };
+    learningMode?: string;
+    targetLearners?: string;
+    pedagogicalBeats?: PedagogicalBeat[];
+    workedExamples?: WorkedExample[];
+    educationalQuality?: { overallStatus: string; findings: QualityFinding[] };
+    visualIntentMappings?: VisualIntentMapping[];
+    retrievalQuestion?: string;
   };
 };
 type Job = { jobId: string; status: string; progress: number; message: string; videoUrl?: string; error?: string };
@@ -57,6 +69,62 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
   const [error, setError] = useState('');
   const [selectedSceneId, setSelectedSceneId] = useState<string>('');
   const [hasMathChanges, setHasMathChanges] = useState<boolean>(false);
+  const [currentTeacher, setCurrentTeacher] = useState<{ ownerId: string; fullName: string; username: string; email: string } | null>(null);
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [myDrafts, setMyDrafts] = useState<Array<{ draftId: string; version: number; status: string; lessonPlan: { title: string } }>>([]);
+  const [showMyDrafts, setShowMyDrafts] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/auth/session')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.authenticated && data.teacher) {
+          setCurrentTeacher(data.teacher);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  async function loadMyDrafts() {
+    try {
+      const res = await fetch('/api/v3/lessons/draft');
+      if (res.ok) {
+        const data = await res.json();
+        setMyDrafts(data.drafts ?? []);
+        setShowMyDrafts(!showMyDrafts);
+      }
+    } catch { /* ignore */ }
+  }
+
+  async function loginAsTeacher(username: string, pass: string) {
+    try {
+      setLoginError('');
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password: pass })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCurrentTeacher(data.teacher);
+        setLoginPassword('');
+        setShowLoginModal(false);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setLoginError(data.message ?? 'Đăng nhập không thành công.');
+      }
+    } catch { setLoginError('Không thể kết nối dịch vụ đăng nhập.'); }
+  }
+
+  async function logoutTeacher() {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    setCurrentTeacher(null);
+    setMyDrafts([]);
+    setShowMyDrafts(false);
+  }
 
   useEffect(() => {
     if (!job || ['completed', 'failed'].includes(job.status)) return;
@@ -106,7 +174,21 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
         setSelectedSceneId(responseData.lessonPlan.storyboard.scenes[0].sceneId);
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      let msg = rawMsg;
+      if (typeof rawMsg === 'string' && rawMsg.trim().startsWith('[') && rawMsg.trim().endsWith(']')) {
+        try {
+          const parsed = JSON.parse(rawMsg);
+          if (Array.isArray(parsed)) {
+            msg = parsed.map((item: { path?: unknown[]; code?: string; maximum?: number; minimum?: number; message?: string }) => {
+              const field = Array.isArray(item.path) ? item.path.join('.') : 'dữ liệu';
+              if (item.code === 'too_big') return `Trường '${field}' vượt quá mức tối đa ${item.maximum}`;
+              if (item.code === 'too_small') return `Trường '${field}' nhỏ hơn mức tối thiểu ${item.minimum}`;
+              return item.message || `Lỗi tại '${field}'`;
+            }).join('; ');
+          }
+        } catch { /* ignore */ }
+      }
       setError(`Supervisor Multi-Agent gặp sự cố: ${msg}`);
     }
     finally { setBusy(false); }
@@ -125,7 +207,21 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
         setSelectedSceneId(legacyData.lessonPlan.storyboard.scenes[0].sceneId);
       }
     } catch (legacyErr) {
-      setError(legacyErr instanceof Error ? legacyErr.message : String(legacyErr));
+      const rawMsg = legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
+      let msg = rawMsg;
+      if (typeof rawMsg === 'string' && rawMsg.trim().startsWith('[') && rawMsg.trim().endsWith(']')) {
+        try {
+          const parsed = JSON.parse(rawMsg);
+          if (Array.isArray(parsed)) {
+            msg = parsed.map((item: { path?: unknown[]; code?: string; maximum?: number; minimum?: number; message?: string }) => {
+              const field = Array.isArray(item.path) ? item.path.join('.') : 'dữ liệu';
+              if (item.code === 'too_big') return `Trường '${field}' vượt quá mức tối đa ${item.maximum}`;
+              return item.message || `Lỗi tại '${field}'`;
+            }).join('; ');
+          }
+        } catch { /* ignore */ }
+      }
+      setError(msg);
     } finally {
       setBusy(false);
     }
@@ -153,7 +249,6 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
     setBusy(true); setError('');
     try {
       const result = await jsonRequest(`/api/jobs/${job.jobId}/resume`, 'POST', {
-        lessonId: draft.draftId,
         artifactId: draft.approvedArtifact.artifactId,
         contentHash: draft.approvedArtifact.contentHash
       });
@@ -172,11 +267,24 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
       const claimStatements = Object.fromEntries(draft.lessonPlan.educationalClaims.map((claim) => [claim.id, claim.statement]));
       const narrationTexts = Object.fromEntries((draft.lessonPlan.storyboard?.scenes ?? []).map((scene) => [scene.sceneId, scene.narration.vietnamese]));
       const subtitleTexts = Object.fromEntries((draft.lessonPlan.storyboard?.scenes ?? []).map((scene) => [scene.sceneId, scene.narration.subtitleVietnamese]));
+      const sceneTitles = Object.fromEntries((draft.lessonPlan.storyboard?.scenes ?? []).map((scene) => [scene.sceneId, scene.title]));
       const visualPayloads = Object.fromEntries((draft.lessonPlan.storyboard?.scenes ?? []).map((scene) => [scene.sceneId, scene.visualPayload]));
+      const visualDefinitions: Record<string, any> = {};
+      for (const scene of draft.lessonPlan.storyboard?.scenes ?? []) {
+        if (scene.visualDefinition) {
+          // Security: strip client-claimed trusted bindings before saving
+          const { trustedMathBindings, ...sanitized } = scene.visualDefinition;
+          visualDefinitions[scene.sceneId] = {
+            ...sanitized,
+            trustedMathBindings: []
+          };
+        }
+      }
       const updated = await jsonRequest(`/api/v3/lessons/${draft.draftId}/draft`, 'PATCH', {
         expectedVersion: draft.version, title: draft.lessonPlan.title,
         learningObjectives: draft.lessonPlan.learningObjectives, claimStatements,
-        narrationTexts, subtitleTexts, visualPayloads
+        narrationTexts, subtitleTexts, sceneTitles, visualPayloads,
+        visualDefinitions: Object.keys(visualDefinitions).length > 0 ? visualDefinitions : undefined
       });
       setDraft(updated);
       setHasMathChanges(false);
@@ -221,6 +329,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
         storyboard: { ...draft.lessonPlan.storyboard, scenes }
       }
     });
+    setHasMathChanges(true);
   }
 
   const activeSceneIndex = draft?.lessonPlan.storyboard?.scenes.findIndex((s) => s.sceneId === selectedSceneId) ?? 0;
@@ -228,6 +337,108 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
 
   return (
     <section className="create-section" aria-labelledby="v3-studio-title" data-testid="v3-teacher-studio">
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 18px', background: 'rgba(30, 41, 59, 0.75)', border: '1px solid #334155', borderRadius: 12, marginBottom: 18 }}>
+        <div>
+          {currentTeacher ? (
+            <div>
+              <span style={{ color: '#4ADE80', fontWeight: 'bold', fontSize: 15 }}>
+                👨‍🏫 {currentTeacher.fullName} ({currentTeacher.username})
+              </span>
+              <span style={{ marginLeft: 8, fontSize: 12, color: '#94A3B8', fontFamily: 'monospace' }}>
+                ID: {currentTeacher.ownerId}
+              </span>
+            </div>
+          ) : (
+            <span style={{ color: '#94A3B8', fontSize: 14 }}>
+              🏛️ Chế độ Local Demo · Chưa đăng nhập phiên giáo viên
+            </span>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {currentTeacher ? (
+            <>
+              <button type="button" className="quick-chip" onClick={loadMyDrafts} style={{ background: '#0369A1', color: '#FFFFFF' }}>
+                📚 Bài học của tôi
+              </button>
+              <button type="button" className="quick-chip" style={{ borderColor: '#F87171', color: '#F87171' }} onClick={logoutTeacher}>
+                Đăng xuất
+              </button>
+            </>
+          ) : (
+            <button type="button" className="quick-chip" style={{ borderColor: '#38BDF8', color: '#38BDF8' }} onClick={() => setShowLoginModal(true)}>
+              🔑 Đăng nhập giáo viên
+            </button>
+          )}
+        </div>
+      </div>
+
+      {showLoginModal && (
+        <div style={{ padding: 16, background: '#1E293B', borderRadius: 12, border: '1px solid #38BDF8', marginBottom: 20 }}>
+          <h4 style={{ margin: '0 0 10px 0', color: '#38BDF8' }}>Đăng nhập phiên thử nghiệm trường học (Pilot)</h4>
+          <p style={{ fontSize: 13, color: '#CBD5E1', marginBottom: 12 }}>Dùng tài khoản cá nhân do quản trị viên pilot cấp. LuminaLearn không nhúng mật khẩu mẫu trong ứng dụng.</p>
+          <div style={{ display: 'grid', gap: 10, maxWidth: 420 }}>
+            <label>Tên đăng nhập<input className="form-input" autoComplete="username" value={loginUsername} onChange={(event) => setLoginUsername(event.target.value)} /></label>
+            <label>Mật khẩu<input className="form-input" type="password" autoComplete="current-password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} /></label>
+            {loginError && <p role="alert" className="error-message">{loginError}</p>}
+            <button type="button" className="quick-chip" style={{ background: '#0284C7', color: '#FFFFFF' }} disabled={!loginUsername || !loginPassword} onClick={() => loginAsTeacher(loginUsername, loginPassword)}>Đăng nhập</button>
+            <button
+              type="button"
+              className="quick-chip"
+              onClick={() => setShowLoginModal(false)}
+            >
+              Đóng
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showMyDrafts && (
+        <div style={{ padding: 16, background: 'rgba(15, 23, 42, 0.9)', borderRadius: 12, border: '1px solid #475569', marginBottom: 20 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <h4 style={{ margin: 0, color: '#E2E8F0' }}>Danh sách bài học của tôi ({myDrafts.length})</h4>
+            <button type="button" className="quick-chip" onClick={() => setShowMyDrafts(false)}>Đóng</button>
+          </div>
+          {myDrafts.length === 0 ? (
+            <p style={{ color: '#94A3B8', fontSize: 13, margin: 0 }}>Chưa có bản thảo nào được lưu cho tài khoản này.</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {myDrafts.map((d) => (
+                <div
+                  key={d.draftId}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    padding: '8px 12px',
+                    background: '#1E293B',
+                    borderRadius: 8
+                  }}
+                >
+                  <div>
+                    <strong>{d.lessonPlan?.title || d.draftId}</strong>
+                    <div style={{ fontSize: 11, color: '#94A3B8' }}>v{d.version} · {d.status}</div>
+                  </div>
+                  <button
+                    type="button"
+                    className="quick-chip"
+                    onClick={async () => {
+                      const res = await fetch(`/api/v3/lessons/${d.draftId}/draft`);
+                      if (res.ok) {
+                        const loaded = await res.json();
+                        setDraft(loaded);
+                        setShowMyDrafts(false);
+                      }
+                    }}
+                  >
+                    Mở bản thảo
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <h2 id="v3-studio-title">V3 Teacher Studio — AI & Toán học</h2>
       <p>{mode === 'mock' ? 'Mock Mode: nội dung fixture xác định, hoàn toàn offline.' : 'Live Gemini: chỉ gọi API sau xác nhận rõ ràng.'}</p>
       <label className="form-label">Lĩnh vực</label>
@@ -275,6 +486,23 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
               onClick={generateLegacyFallback}
             >
               ⚙️ Tạo bằng bộ lập kế hoạch đơn lẻ (Legacy Fallback)
+            </button>
+          )}
+          {(error.includes('503') || error.includes('quá tải') || error.includes('Gemini') || error.includes('gemini_transient_failed')) && (
+            <button
+              type="button"
+              className="quick-chip"
+              style={{ marginTop: '6px', background: 'rgba(34, 211, 238, 0.15)', borderColor: 'rgba(34, 211, 238, 0.4)', color: '#22d3ee' }}
+              disabled={busy}
+              onClick={() => {
+                setMode('mock');
+                setError('');
+                setTimeout(() => {
+                  generate();
+                }, 50);
+              }}
+            >
+              ⚙️ Chuyển sang Mock offline (Khuyến nghị để không bị gián đoạn)
             </button>
           )}
         </div>
@@ -330,6 +558,48 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
             setDraft({ ...draft, lessonPlan: { ...draft.lessonPlan, learningObjectives: objectives } });
           }} />)}
 
+          <section aria-label="Cấu trúc sư phạm V3" style={{ margin: '16px 0', padding: 14, border: '1px solid #334155', borderRadius: 10, background: 'rgba(15, 23, 42, 0.55)' }}>
+            <h3 style={{ marginTop: 0 }}>Đề cương sư phạm & chất lượng</h3>
+            <p><strong>Chế độ học:</strong> {draft.lessonPlan.learningMode ?? 'chưa phân loại'}{draft.lessonPlan.targetLearners ? ` · ${draft.lessonPlan.targetLearners}` : ''}</p>
+            <details open>
+              <summary style={{ cursor: 'pointer', color: '#7DD3FC' }}>Pedagogical beats ({draft.lessonPlan.pedagogicalBeats?.length ?? 0})</summary>
+              <ol style={{ paddingLeft: 22 }}>
+                {(draft.lessonPlan.pedagogicalBeats ?? []).map((beat) => (
+                  <li key={beat.beatId} style={{ margin: '8px 0' }}>
+                    <strong>{beat.learningObjective}</strong>
+                    <div style={{ color: '#CBD5E1', fontSize: 13 }}>{beat.educationalQuestion}</div>
+                    <small>{beat.pedagogicalIntent} · {beat.visualIntent} · {beat.contentValidationStatus}</small>
+                  </li>
+                ))}
+              </ol>
+            </details>
+            <details>
+              <summary style={{ cursor: 'pointer', color: '#7DD3FC' }}>Worked examples ({draft.lessonPlan.workedExamples?.length ?? 0})</summary>
+              {(draft.lessonPlan.workedExamples ?? []).map((example) => (
+                <article key={example.exampleId} style={{ marginTop: 8, padding: 10, borderLeft: '3px solid #38BDF8' }}>
+                  <strong>{example.title}</strong> · {example.verificationStatus}
+                  <code style={{ display: 'block', margin: '6px 0', overflowWrap: 'anywhere' }}>{example.sourceExpression}</code>
+                  <ol>{example.steps.map((step) => <li key={step.stepId}><code>{step.displayExpression}</code> — {step.narrationText} ({step.verificationStatus})</li>)}</ol>
+                </article>
+              ))}
+            </details>
+            <details open={draft.lessonPlan.educationalQuality?.overallStatus === 'BLOCKED' || draft.lessonPlan.educationalQuality?.overallStatus === 'NEEDS_REVIEW'}>
+              <summary style={{ cursor: 'pointer', color: '#7DD3FC' }}>Educational quality: {draft.lessonPlan.educationalQuality?.overallStatus ?? 'chưa kiểm tra'}</summary>
+              <ul>
+                {(draft.lessonPlan.educationalQuality?.findings ?? []).map((finding) => (
+                  <li key={finding.findingId} style={{ color: finding.status === 'BLOCKED' ? '#F87171' : finding.status === 'NEEDS_REVIEW' ? '#FBBF24' : '#CBD5E1' }}>
+                    <strong>{finding.status}</strong> · {finding.message}{finding.remediation ? ` — ${finding.remediation}` : ''}
+                  </li>
+                ))}
+              </ul>
+            </details>
+            <details>
+              <summary style={{ cursor: 'pointer', color: '#7DD3FC' }}>Visual explanation intents</summary>
+              <ul>{(draft.lessonPlan.visualIntentMappings ?? []).map((mapping) => <li key={mapping.visualIntent}><strong>{mapping.visualIntent}</strong>: {mapping.recommendedActions.join(', ')} · {mapping.readiness}{mapping.reviewReason ? ` — ${mapping.reviewReason}` : ''}</li>)}</ul>
+            </details>
+            {draft.lessonPlan.retrievalQuestion && <p><strong>Câu hỏi truy hồi:</strong> {draft.lessonPlan.retrievalQuestion}</p>}
+          </section>
+
           {/* CHECKPOINT F: SymPy Mathematical Verification Panel */}
           <MathematicalVerificationPanelV3
             claims={draft.lessonPlan.educationalClaims}
@@ -338,6 +608,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
                 item.id === claimId ? { ...item, statement } : item
               );
               setDraft({ ...draft, lessonPlan: { ...draft.lessonPlan, educationalClaims: claims } });
+              setHasMathChanges(true);
             }}
             hasMathChanges={hasMathChanges}
           />
@@ -346,7 +617,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
           {draft.lessonPlan.storyboard && (
             <>
               {/* Timeline Editor */}
-              <TimelineEditorV3
+              <TimelineViewerV3
                 scenes={draft.lessonPlan.storyboard.scenes}
                 totalDurationSeconds={draft.lessonPlan.storyboard.totalDurationSeconds}
                 selectedSceneId={selectedSceneId || draft.lessonPlan.storyboard.scenes[0]?.sceneId}
@@ -364,10 +635,13 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
               {/* Active Scene Inspector & Remotion Preview */}
               {currentScene && (
                 <SceneInspectorV3
+                  draftId={draft.draftId}
+                  draftVersion={draft.version}
                   scene={currentScene}
                   onUpdateScene={(updated) => handleUpdateScene(activeSceneIndex >= 0 ? activeSceneIndex : 0, updated)}
                   onMathModified={() => setHasMathChanges(true)}
                   subtitlesEnabled={subtitlesEnabled}
+                  isDraftDirty={hasMathChanges}
                 />
               )}
 
@@ -388,6 +662,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
                         onChange={(event) => {
                           const scenes = draft.lessonPlan.storyboard!.scenes.map((item, i) => i === sceneIndex ? { ...item, narration: { ...item.narration, vietnamese: event.target.value } } : item);
                           setDraft({ ...draft, lessonPlan: { ...draft.lessonPlan, storyboard: { ...draft.lessonPlan.storyboard!, scenes } } });
+                          setHasMathChanges(true);
                         }}
                       />
                       <textarea
@@ -398,6 +673,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
                         onChange={(event) => {
                           const scenes = draft.lessonPlan.storyboard!.scenes.map((item, i) => i === sceneIndex ? { ...item, narration: { ...item.narration, subtitleVietnamese: event.target.value } } : item);
                           setDraft({ ...draft, lessonPlan: { ...draft.lessonPlan, storyboard: { ...draft.lessonPlan.storyboard!, scenes } } });
+                          setHasMathChanges(true);
                         }}
                       />
                       <details>
@@ -412,6 +688,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
                               const payload = JSON.parse(event.target.value) as unknown;
                               const scenes = draft.lessonPlan.storyboard!.scenes.map((item, i) => i === sceneIndex ? { ...item, visualPayload: payload } : item);
                               setDraft({ ...draft, lessonPlan: { ...draft.lessonPlan, storyboard: { ...draft.lessonPlan.storyboard!, scenes } } });
+                              setHasMathChanges(true);
                               setError('');
                             } catch {
                               setError('Visual payload phải là JSON hợp lệ; máy chủ sẽ kiểm tra đúng sceneType trước khi lưu.');
@@ -430,7 +707,7 @@ export function V3TeacherStudio({ liveEnabled }: { liveEnabled: boolean }) {
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="quick-chip" disabled={busy || draft.status === 'approved'} onClick={save}>Lưu & tái kiểm định</button>
             <button className="quick-chip" disabled={busy || draft.status !== 'needs_review'} onClick={review}>Xác nhận rà soát ngữ nghĩa</button>
-            <button className="btn-generate" disabled={busy || draft.status !== 'ready_for_approval' || draft.lessonPlan.capabilityReport.renderReadiness !== 'render_ready'} onClick={approve}>Duyệt & render MP4</button>
+            <button className="btn-generate" disabled={busy || hasMathChanges || draft.status !== 'ready_for_approval' || draft.lessonPlan.capabilityReport.renderReadiness !== 'render_ready'} onClick={approve}>Duyệt & render MP4</button>
             <button className="quick-chip" disabled={busy || draft.status !== 'approved' || !draft.approvedArtifact} onClick={retryEnqueue}>Xếp hàng lại bản đã duyệt</button>
           </div>
         </div>

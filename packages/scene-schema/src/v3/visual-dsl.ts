@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { NoExecutableString, SafeIdString } from '../v2/document';
+import { ScientificVisualDataV1Schema } from './visual-engine';
 
 /**
  * CHECKPOINT E: STRICT VISUAL SCENE DSL
@@ -222,7 +223,8 @@ export const GenericSceneVisualPayloadSchema = z.object({
   sceneType: z.enum(['formula_derivation', 'graph_plot', 'flowchart_simulation', 'comparison_table']),
   headline: NoExecutableString.optional(),
   formulaTex: NoExecutableString.optional(),
-  notes: NoExecutableString.optional()
+  notes: NoExecutableString.optional(),
+  scientificData: ScientificVisualDataV1Schema.optional()
 }).strict();
 export type GenericSceneVisualPayload = z.infer<typeof GenericSceneVisualPayloadSchema>;
 
@@ -291,7 +293,9 @@ export type VisualLayoutPresetV3 = z.infer<typeof VisualLayoutPresetV3Schema>;
 export const VisualStylePresetV3Schema = z.enum([
   'clean_educational_infographic',
   'math_chalkboard',
-  'ai_neural_visualization'
+  'ai_neural_visualization',
+  'ai_data_story',
+  'systems_whiteboard'
 ]);
 export type VisualStylePresetV3 = z.infer<typeof VisualStylePresetV3Schema>;
 
@@ -321,6 +325,13 @@ export const VisualTextElementSchema = z.object({
   animation: VisualAnimationPresetV3Schema.default('fade_in')
 }).strict();
 
+export const MathContentPolicySchema = z.enum([
+  'formal_verified',
+  'illustrative_unverified',
+  'conceptual'
+]);
+export type MathContentPolicy = z.infer<typeof MathContentPolicySchema>;
+
 export const VisualFormulaElementSchema = z.object({
   elementType: z.literal('formula'),
   elementId: SafeIdString,
@@ -328,6 +339,7 @@ export const VisualFormulaElementSchema = z.object({
   revealSpeed: z.enum(['slow', 'medium', 'fast', 'instant']).default('medium'),
   highlightTerms: z.array(z.string().trim().max(50)).default([]),
   claimId: SafeIdString.optional(),
+  contentPolicy: MathContentPolicySchema.optional(),
   fontSize: z.number().min(12).max(72).default(36),
   color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#38BDF8'),
   animation: VisualAnimationPresetV3Schema.default('step_reveal')
@@ -338,10 +350,15 @@ export const VisualGraphElementSchema = z.object({
   elementId: SafeIdString,
   functionType: z.enum(['convex_quadratic', 'sine', 'polynomial', 'exponential', 'custom_curve']),
   expression: z.string().max(100).optional(),
+  claimId: SafeIdString.optional(),
+  contentPolicy: MathContentPolicySchema.optional(),
   xRange: z.tuple([z.number().finite(), z.number().finite()]).default([-3, 3]),
   yRange: z.tuple([z.number().finite(), z.number().finite()]).default([-1, 9]),
   showTangentLine: z.boolean().default(false),
   tangentAtX: z.number().finite().optional(),
+  showSecantLine: z.boolean().optional(),
+  secantFromX: z.number().finite().optional(),
+  secantToX: z.number().finite().optional(),
   animation: VisualAnimationPresetV3Schema.default('draw_line')
 }).strict();
 
@@ -436,6 +453,29 @@ export const VisualShapeElementSchema = z.object({
   borderWidth: z.number().nonnegative().default(1)
 }).strict();
 
+export const VisualPolygonElementSchema = z.object({
+  elementType: z.literal('polygon'),
+  elementId: SafeIdString,
+  points: z.array(z.tuple([z.number().finite(), z.number().finite()])).min(3).max(16),
+  fill: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#38BDF8'),
+  fillOpacity: z.number().min(0).max(1).default(0.25),
+  strokeColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#38BDF8'),
+  strokeWidth: z.number().nonnegative().default(2),
+  label: z.string().max(50).optional(),
+  claimId: SafeIdString.optional()
+}).strict();
+
+export const VisualSegmentElementSchema = z.object({
+  elementType: z.literal('segment'),
+  elementId: SafeIdString,
+  start: z.tuple([z.number().finite(), z.number().finite()]),
+  end: z.tuple([z.number().finite(), z.number().finite()]),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#94A3B8'),
+  strokeWidth: z.number().nonnegative().default(2),
+  strokeDasharray: z.string().max(20).optional(),
+  label: z.string().max(50).optional()
+}).strict();
+
 export const VisualCalloutElementSchema = z.object({
   elementType: z.literal('callout'),
   elementId: SafeIdString,
@@ -484,6 +524,8 @@ export const VisualElementV3Schema = z.discriminatedUnion('elementType', [
   VisualAxesElementSchema,
   VisualPointElementSchema,
   VisualVectorElementSchema,
+  VisualSegmentElementSchema,
+  VisualPolygonElementSchema,
   VisualArrowElementSchema,
   VisualMatrixElementSchema,
   VisualChartElementSchema,
@@ -496,6 +538,15 @@ export const VisualElementV3Schema = z.discriminatedUnion('elementType', [
   VisualTimelineMarkerElementSchema
 ]);
 export type VisualElementV3 = z.infer<typeof VisualElementV3Schema>;
+export type VisualGraphElement = Extract<VisualElementV3, { elementType: 'graph' }>;
+export type VisualPointElement = Extract<VisualElementV3, { elementType: 'point' }>;
+export type VisualVectorElement = Extract<VisualElementV3, { elementType: 'vector' }>;
+export type VisualSegmentElement = Extract<VisualElementV3, { elementType: 'segment' }>;
+export type VisualPolygonElement = Extract<VisualElementV3, { elementType: 'polygon' }>;
+export type VisualShapeElement = Extract<VisualElementV3, { elementType: 'shape' }>;
+export type VisualHighlightedRegionElement = Extract<VisualElementV3, { elementType: 'highlighted_region' }>;
+export type VisualFormulaElement = Extract<VisualElementV3, { elementType: 'formula' }>;
+export type VisualMatrixElement = Extract<VisualElementV3, { elementType: 'matrix' }>;
 
 // Mathematical Binding: Binds visual formula to SymPy-verified claim
 export const VerifiedMathBindingV3Schema = z.object({
@@ -508,6 +559,19 @@ export const VerifiedMathBindingV3Schema = z.object({
   isVerified: z.boolean().default(true)
 }).strict();
 export type VerifiedMathBindingV3 = z.infer<typeof VerifiedMathBindingV3Schema>;
+
+export const TrustedVisualMathBindingV3Schema = z.object({
+  authority: z.literal('server_sympy_v3'),
+  claimId: SafeIdString,
+  elementId: SafeIdString,
+  verifiedExpression: z.string().trim().min(1).max(300),
+  normalizedExpressionFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  verificationResult: z.literal('formally_verified'),
+  verificationTimestamp: z.string().datetime(),
+  approvedDraftVersion: z.number().int().positive(),
+  sourceSceneId: SafeIdString
+}).strict();
+export type TrustedVisualMathBindingV3 = z.infer<typeof TrustedVisualMathBindingV3Schema>;
 
 // Visual Data Binding: Dynamic parameter links
 export const VisualDataBindingV3Schema = z.object({
@@ -529,7 +593,56 @@ export const VisualSceneDefinitionV3Schema = z.object({
   elements: z.array(VisualElementV3Schema).default([]),
   timeline: VisualTimelineV3Schema.optional(),
   mathBindings: z.array(VerifiedMathBindingV3Schema).default([]),
+  trustedMathBindings: z.array(TrustedVisualMathBindingV3Schema).default([]),
   dataBindings: z.array(VisualDataBindingV3Schema).default([]),
   legacyPayload: EducationalVisualPayloadSchema.optional()
-}).strict();
+}).strict().superRefine((scene, ctx) => {
+  const ids = new Set<string>();
+  scene.elements.forEach((element, index) => {
+    if (ids.has(element.elementId)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['elements', index, 'elementId'], message: `Trùng elementId '${element.elementId}'` });
+    ids.add(element.elementId);
+    if ('position' in element && element.position && typeof element.position === 'object' && (element.position.x < 0 || element.position.x > 720 || element.position.y < 0 || element.position.y > 1280)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['elements', index, 'position'], message: 'Vị trí phải nằm trong canvas an toàn 720x1280' });
+    }
+    if (element.elementType === 'matrix' && (element.values.length !== element.rows || element.values.some((row) => row.length !== element.cols))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['elements', index, 'values'], message: 'Kích thước values phải khớp rows x cols' });
+    }
+    if (element.elementType === 'graph' && (element.xRange[0] >= element.xRange[1] || element.yRange[0] >= element.yRange[1])) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['elements', index], message: 'Miền đồ thị phải tăng nghiêm ngặt' });
+    }
+  });
+  scene.elements.forEach((element, index) => {
+    if (element.elementType === 'arrow' && (!ids.has(element.fromElementId) || !ids.has(element.toElementId))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['elements', index], message: 'Arrow tham chiếu element không tồn tại' });
+    }
+    if (element.elementType === 'neural_connection') {
+      const nodes = scene.elements.filter((candidate) => candidate.elementType === 'neural_node');
+      const from = nodes.some((node) => node.layerIndex === element.fromLayer && node.nodeIndex === element.fromNode);
+      const to = nodes.some((node) => node.layerIndex === element.toLayer && node.nodeIndex === element.toNode);
+      if (!from || !to || element.toLayer <= element.fromLayer) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['elements', index], message: 'Neural connection phải nối xuôi giữa hai node tồn tại' });
+    }
+  });
+  scene.mathBindings.forEach((binding, index) => {
+    const element = scene.elements.find((candidate) => candidate.elementId === binding.elementId);
+    if (!element || (element.elementType !== 'formula' && element.elementType !== 'graph')) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mathBindings', index, 'elementId'], message: 'Math binding phải tham chiếu formula hoặc graph element tồn tại' });
+  });
+  scene.trustedMathBindings.forEach((binding, index) => {
+    const element = scene.elements.find((candidate) => candidate.elementId === binding.elementId);
+    if (!element || (element.elementType !== 'formula' && element.elementType !== 'graph') || element.claimId !== binding.claimId || binding.sourceSceneId !== scene.sceneId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['trustedMathBindings', index], message: 'Trusted binding phải khớp formula/graph, claim và scene hiện tại' });
+    }
+  });
+  scene.dataBindings.forEach((binding, index) => {
+    if (!ids.has(binding.targetElementId)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['dataBindings', index, 'targetElementId'], message: 'Data binding tham chiếu element không tồn tại' });
+  });
+  scene.timeline?.markers.forEach((marker, index) => {
+    if (marker.frame >= scene.timeline!.durationFrames) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['timeline', 'markers', index, 'frame'], message: 'Timeline marker nằm ngoài durationFrames' });
+  });
+});
 export type VisualSceneDefinitionV3 = z.infer<typeof VisualSceneDefinitionV3Schema>;
+
+export const VISUAL_PRIMITIVE_READINESS_V3 = {
+  text: 'render_ready', formula: 'render_ready', graph: 'render_ready', axes: 'render_ready', point: 'render_ready',
+  arrow: 'render_ready', matrix: 'render_ready', labeled_step: 'render_ready', neural_node: 'render_ready', neural_connection: 'render_ready',
+  vector: 'schema_only', chart: 'schema_only', shape: 'schema_only', callout: 'schema_only', highlighted_region: 'schema_only', timeline_marker: 'schema_only'
+} as const satisfies Record<VisualElementV3['elementType'], 'schema_only' | 'preview_ready' | 'render_ready' | 'end_to_end_verified'>;
